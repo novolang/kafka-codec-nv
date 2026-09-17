@@ -1,0 +1,223 @@
+// kafkahdr.nv — the four fields in front of every request and the one
+// in front of every response.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE HEADER IS TINY AND ITS VERSION IS NOT ITS MESSAGE'S.  A request
+// header carries an API key, an API version, a correlation id and a
+// client id — and the header's own version is a different number from
+// the version in it.  Header v1 is those four fields; header v2 is
+// those four plus a tagged-field section.  Which one applies is
+// decided by whether the MESSAGE's version is flexible, which is
+// `kafkaapi.header_request_version`, so no caller of this module ever
+// computes it.
+//
+// A RESPONSE HEADER IS ONE FIELD, AND READING IT WRONG COSTS THE
+// CONNECTION.  Response header v0 is the correlation id alone; v1 adds
+// a tagged-field section.  There is nothing in the bytes that says
+// which it is: the reader has to already know, from the key and
+// version of the request it sent.  That is why `decode_response_header`
+// takes the key and the version rather than deriving them, and why
+// `kafkaframe` keeps a table from correlation id to (key, version) —
+// without it, a pipelined client holding four outstanding requests
+// cannot tell which shape the next four bytes are in.
+//
+// AND `ApiVersions` BREAKS THE RULE.  Its response header is v0 even
+// at its flexible versions.  The fact lives in
+// `kafkaapi.header_response_version`; this module just asks.
+//
+// THE CORRELATION ID IS THE CLIENT'S AND THE BROKER ECHOES IT.  Kafka
+// does not multiplex: a broker answers one connection's requests in
+// the order they arrived, so the correlation id is not needed for
+// routing.  It is needed for CHECKING — a mismatch means the stream is
+// no longer where the client thinks it is, and
+// `kafkaerror.KafkaCorrelationMismatch` is fatal to the connection for
+// that reason.
+//
+// THE CLIENT ID IS NULLABLE AND THE DIFFERENCE MATTERS.  A null client
+// id is "unset"; an empty one is a client whose name is the empty
+// string, which is what `CLIENT LIST`-style broker tooling then shows.
+// `request_header` takes a `Str` and treats `""` as the empty name;
+// `with_null_client_id` is the other one, spelled separately so the
+// choice is visible.
+
+use kafkaapi
+use kafkaerror
+use kafkaprim
+
+// What precedes a request.
+pub struct KafkaRequestHeader
+    // Which request this is.
+    key: kafkaapi.KafkaApiKey
+    // Which version of it.  Not the header's own version — see the
+    // module comment.
+    version: Int
+    // The client's number for this request, echoed back in the
+    // response.
+    correlation_id: Int
+    // The name this client is known by in the broker's logs and
+    // metrics.  A client that leaves it empty is one nobody can find
+    // when it is the one holding a partition.
+    client_id: Str
+    // Whether `client_id` is sent as null rather than as the text.
+    client_id_is_null: Bool
+    // Tagged fields to send, for a header v2.  Empty is the ordinary
+    // case; a caller carries one when a KIP this release does not name
+    // needs it.
+    tagged: [kafkaprim.KafkaTaggedField]
+
+// What precedes a response.
+pub struct KafkaResponseHeader
+    // The correlation id of the request this answers.  Checked, not
+    // routed on — see the module comment.
+    correlation_id: Int
+    // The tagged fields the section carried, for a header v1.  Handed
+    // back rather than discarded, for the same reason
+    // `kafkaprim.read_tagged_fields` does.
+    tagged: [kafkaprim.KafkaTaggedField]
+
+// A decoded request header, and the cursor positioned at the body.
+//
+// Exists so a broker test double, a protocol-aware proxy or a replay
+// tool can read what a client sent.  A frame is a frame whichever end
+// sent it, and the decoder for one direction is not usable for the
+// other because the fields differ.
+pub struct KafkaRequestHeaderRead
+    header: KafkaRequestHeader
+    cursor: kafkaprim.KafkaCursor
+
+// A decoded response header, and the cursor positioned at the body.
+pub struct KafkaResponseHeaderRead
+    header: KafkaResponseHeader
+    cursor: kafkaprim.KafkaCursor
+
+// A request header for a key, a version, a correlation id and a client
+// name.
+//
+// ```novo
+// use kafkahdr
+//
+// fn main() [io]
+//     let h = kafkahdr.request_header(KafkaMetadata, 9, 1, "orders-indexer")
+//     println("${h.correlation_id}")
+// ```
+pub fn request_header(k: kafkaapi.KafkaApiKey, version: Int, correlation_id: Int,
+                      client_id: Str) -> KafkaRequestHeader
+    todo("kafka-codec-nv.kafkahdr.request_header")
+
+// The same header with the client id sent as null rather than as
+// text.
+//
+// A separate function because null and empty are different values on
+// the wire and mean different things to a broker — see the module
+// comment.
+pub fn with_null_client_id(h: KafkaRequestHeader) -> KafkaRequestHeader
+    todo("kafka-codec-nv.kafkahdr.with_null_client_id")
+
+// The same header carrying tagged fields.
+//
+// Refused on a header version that has no tagged-field section:
+// writing them would produce bytes a classic broker cannot parse, and
+// dropping them silently would lose whatever the caller meant to send.
+pub fn with_tagged(h: KafkaRequestHeader,
+                   fields: [kafkaprim.KafkaTaggedField]) -> Result<KafkaRequestHeader, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkahdr.with_tagged")
+
+// Which header version this request's header is written at.
+//
+// A thin reading of `kafkaapi.header_request_version`, here so a
+// caller holding a header does not have to take it apart to ask.
+pub fn request_header_version(h: KafkaRequestHeader) -> Int
+    todo("kafka-codec-nv.kafkahdr.request_header_version")
+
+// Write a request header into a writer.
+//
+// The writer's style must already be the message's — `kafkaapi.wire_style`
+// computes it — because the header's compact-string spelling and the
+// body's are the same spelling and a header written in the other one
+// desynchronises everything after it.
+//
+// ```novo
+// use kafkahdr
+// use kafkaapi
+// use kafkaprim
+//
+// fn main() [io]
+//     let h = kafkahdr.request_header(KafkaApiVersions, 3, 1, "novo")
+//     let w = kafkaprim.writer(kafkaapi.wire_style(KafkaApiVersions, 3))
+//     match kafkahdr.encode_request_header(w, h)
+//         Ok(w2) => println("${kafkaprim.written(w2)}")
+//         Err(_) => println("refused")
+// ```
+pub fn encode_request_header(w: kafkaprim.KafkaWriter,
+                             h: KafkaRequestHeader) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkahdr.encode_request_header")
+
+// Read a request header from a cursor.
+//
+// Refuses an API key this package does not encode, as
+// `kafkaerror.KafkaUnknownApiKey` — because a reader of a request has
+// no way to skip a body whose shape it does not know, and the frame's
+// size prefix covers header and body together.
+//
+// The cursor's style must be the message's, which for a reader means
+// the key and version have to be read before the style is known.  The
+// key and version are at fixed offsets `0` and `2` in every header
+// version, and that is what makes it possible: this function reads
+// those two with a classic cursor, computes the style, and continues.
+pub fn decode_request_header(c: kafkaprim.KafkaCursor) -> Result<KafkaRequestHeaderRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkahdr.decode_request_header")
+
+// Read a response header, given the key and version of the request it
+// answers.
+//
+// THE KEY AND VERSION ARE ARGUMENTS BECAUSE THE BYTES DO NOT CARRY
+// THEM.  A response header is a correlation id and possibly a
+// tagged-field section, and nothing in it says which.  See the module
+// comment; `kafkaframe` is what remembers.
+//
+// ```novo
+// use kafkahdr
+// use kafkaapi
+// use kafkaprim
+//
+// fn main() [io]
+//     let c = kafkaprim.cursor(bytes.zeros(4),
+//                              kafkaapi.wire_style(KafkaMetadata, 9))
+//     match kafkahdr.decode_response_header(c, KafkaMetadata, 9)
+//         Ok(r)  => println("${r.header.correlation_id}")
+//         Err(_) => println("truncated")
+// ```
+pub fn decode_response_header(c: kafkaprim.KafkaCursor, k: kafkaapi.KafkaApiKey,
+                              version: Int) -> Result<KafkaResponseHeaderRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkahdr.decode_response_header")
+
+// Write a response header.
+//
+// The other direction, for a test double or a proxy that answers.
+pub fn encode_response_header(w: kafkaprim.KafkaWriter, h: KafkaResponseHeader,
+                              k: kafkaapi.KafkaApiKey,
+                              version: Int) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkahdr.encode_response_header")
+
+// A response header carrying a correlation id and no tagged fields.
+pub fn response_header(correlation_id: Int) -> KafkaResponseHeader
+    todo("kafka-codec-nv.kafkahdr.response_header")
+
+// Check that a response header answers the request that was sent.
+//
+// Answers `kafkaerror.KafkaCorrelationMismatch` when it does not.  A
+// mismatch is fatal to the connection rather than to the request:
+// there is no way to resynchronise a stream whose framing is a length
+// prefix and whose ordering has been lost.
+//
+// ```novo
+// use kafkahdr
+//
+// fn main() [io]
+//     match kafkahdr.check_correlation(kafkahdr.response_header(7), 7)
+//         Some(_) => println("the stream is lost")
+//         None    => println("this answers request 7")
+// ```
+pub fn check_correlation(h: KafkaResponseHeader, expected: Int) -> ?kafkaerror.KafkaFault
+    todo("kafka-codec-nv.kafkahdr.check_correlation")

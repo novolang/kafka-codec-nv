@@ -1,0 +1,124 @@
+// kafkaframe_tests.nv — the API suite for the state machine: requests
+// in, bytes out, bytes in, responses out.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// kafka-codec-nv.kafkaframe.<fn>`.  What is asserted is that a partial
+// read is not an error, that a produce with `acks = 0` is never queued,
+// and that the pending table is what makes a response decodable at all.
+
+use std.test
+use kafkaframe
+use kafkarecords
+use kafkareq
+
+fn an_exchange() -> kafkaframe.KafkaExchange
+    kafkaframe.exchange("orders-indexer")
+
+@test
+fn test_an_exchange_owns_no_socket_and_no_clock() [io]
+    // Everything it does is a pure function of bytes and values, which
+    // is what keeps this package `core` and what lets a test drive a
+    // whole produce-fetch cycle out of a byte array.
+    test.case("a new exchange has nothing outstanding and nothing buffered")
+    test.assert(kafkaframe.pending_count(an_exchange()) == 0)
+    test.assert(kafkaframe.buffered(an_exchange()) == 0)
+    test.assert(list.len(kafkaframe.pending_requests(an_exchange())) == 0)
+
+    test.case("the frame ceiling is the caller's, because the length is the broker's number")
+    test.assert(kafkaframe.with_max_frame_bytes(an_exchange(), 104857600).max_frame_bytes
+                == 104857600)
+
+    test.case("before the handshake it sends this package's own minimum for a key")
+    // Which is what makes the `ApiVersions` request itself sendable on
+    // a connection that knows nothing about the broker.
+    test.assert(kafkaframe.version_for(an_exchange(), KafkaApiVersions) >= 0)
+
+    test.case("and after it, the negotiated version")
+    let x = kafkaframe.with_versions(an_exchange(),
+                                     [KafkaApiSupport { key: 3, min_version: 9, max_version: 9 }])
+    test.assert(kafkaframe.version_for(x, KafkaMetadata) == 9)
+
+@test
+fn test_a_produce_with_acks_zero_is_never_put_in_the_pending_table() [io]
+    // It gets no response — not an empty one, none.  An exchange that
+    // queued it would match the NEXT response against it and be wrong
+    // about every response for the life of the connection.
+    test.case("`expects_response` is a fact about the protocol, so it is public")
+    test.assert(not kafkaframe.expects_response(
+        KafkaProduceReq(kafkareq.produce_request(0, 30000, []))))
+    test.assert(kafkaframe.expects_response(
+        KafkaProduceReq(kafkareq.produce_request(-1, 30000, []))))
+    test.assert(kafkaframe.expects_response(
+        KafkaApiVersionsReq(kafkareq.api_versions_request("novo-kafka-nv", "0.0.1"))))
+
+    test.case("and sending one leaves the table empty while still answering bytes")
+    match kafkaframe.send(an_exchange(),
+                          KafkaProduceReq(kafkareq.produce_request(0, 30000, [])),
+                          kafkarecords.no_codecs())
+        Ok(out) =>
+            test.assert(not out.expects_response)
+            test.assert(kafkaframe.pending_count(out.exchange) == 0)
+            test.assert(bytes.len(out.bytes) > 4)
+        Err(_)  => test.fail("an empty produce encodes")
+
+@test
+fn test_a_short_read_is_the_ordinary_case_and_not_an_error() [io]
+    // A socket read returns whatever the kernel had, which for a
+    // pipelined client is routinely a frame and a half.
+    test.case("feeding nothing cannot fail, because nothing is decoded yet")
+    test.assert(kafkaframe.buffered(kafkaframe.feed(an_exchange(), bytes.zeros(0))) == 0)
+
+    test.case("feeding two bytes buffers two bytes")
+    test.assert(kafkaframe.buffered(kafkaframe.feed(an_exchange(), bytes.zeros(2))) == 2)
+
+    test.case("draining a buffer with no whole frame answers no responses")
+    match kafkaframe.drain(kafkaframe.feed(an_exchange(), bytes.zeros(2)),
+                           kafkarecords.no_codecs())
+        Ok(d)  => test.assert(list.len(d.answers) == 0)
+        Err(_) => test.fail("a partial frame is `not yet`, not corruption")
+
+    test.case("and the framing question can be asked on its own")
+    match kafkaframe.frame_length(bytes.zeros(2), 0, 104857600)
+        Ok(some) =>
+            match some
+                Some(_) => test.fail("two bytes are not a four-byte length")
+                None    => test.assert(true)
+        Err(_)   => test.fail("a short buffer is not a refusal")
+
+@test
+fn test_the_framing_is_a_four_byte_length_and_nothing_else() [io]
+    // There is no magic number and no delimiter, which is why a decoder
+    // that loses its place cannot resynchronise.
+    test.case("framing a body adds exactly four bytes")
+    test.assert(bytes.len(kafkaframe.frame(bytes.zeros(6))) == 10)
+
+    test.case("and unframing takes them off again")
+    match kafkaframe.unframe(kafkaframe.frame(bytes.zeros(6)), 0, 104857600)
+        Ok(body) => test.assert(bytes.len(body) == 6)
+        Err(_)   => test.fail("what frame produced, unframe reads")
+
+    test.case("a buffer shorter than its declared length is `not yet`")
+    match kafkaframe.unframe(bytes.zeros(4), 0, 104857600)
+        Ok(_)  => test.fail("a zero-length frame is not six bytes of body")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_reset_keeps_what_it_learned_about_the_broker() [io]
+    // The negotiated versions and the client id are facts about the
+    // broker rather than about the socket, so a reconnect does not
+    // redo the `ApiVersions` handshake against a broker it has already
+    // asked.
+    let x = kafkaframe.with_versions(an_exchange(),
+                                     [KafkaApiSupport { key: 3, min_version: 9, max_version: 9 }])
+
+    test.case("the versions and the client id survive")
+    let r = kafkaframe.reset(x)
+    test.assert(kafkaframe.version_for(r.exchange, KafkaMetadata) == 9)
+    test.assert(r.exchange.client_id == "orders-indexer")
+
+    test.case("the buffer and the pending table do not")
+    test.assert(kafkaframe.buffered(r.exchange) == 0)
+    test.assert(kafkaframe.pending_count(r.exchange) == 0)
+
+    test.case("and what was in flight is handed back, so a caller can resend it")
+    test.assert(list.len(r.abandoned) == 0)

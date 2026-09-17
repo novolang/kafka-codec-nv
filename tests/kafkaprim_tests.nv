@@ -1,0 +1,227 @@
+// kafkaprim_tests.nv — the API suite for the two spellings and the two
+// varints.
+//
+// RED ON PURPOSE, like every suite here: each assertion reaches
+// `not implemented: kafka-codec-nv.kafkaprim.<fn>`.  What is asserted
+// is the design — that the wire style is carried rather than passed per
+// field, that null and empty are different answers, that the unsigned
+// and the zigzag varint are separate functions, and that a
+// tagged-field section costs nothing on a classic message.
+
+use std.test
+use kafkaprim
+
+// A classic cursor over an empty buffer.
+fn classic() -> kafkaprim.KafkaCursor
+    kafkaprim.cursor(bytes.zeros(0), KafkaClassic)
+
+// A flexible cursor over an empty buffer.
+fn flexible() -> kafkaprim.KafkaCursor
+    kafkaprim.cursor(bytes.zeros(0), KafkaFlexible)
+
+@test
+fn test_the_wire_style_is_carried_by_the_cursor_not_passed_per_field() [io]
+    // The switch is per MESSAGE VERSION, not per field.  A codec that
+    // took the style as an argument to `read_str` would have to be
+    // told at every call site, and one call site would eventually be
+    // told the wrong thing.
+    test.case("a cursor remembers which spelling its message uses")
+    match kafkaprim.style_of(flexible())
+        KafkaFlexible => test.assert(true)
+        KafkaClassic  => test.fail("a flexible cursor reads flexible fields")
+
+    test.case("and a classic one remembers the other")
+    match kafkaprim.style_of(classic())
+        KafkaClassic  => test.assert(true)
+        KafkaFlexible => test.fail("a classic cursor reads classic fields")
+
+    test.case("an empty buffer has nothing left and is at its end")
+    test.assert(kafkaprim.remaining(classic()) == 0)
+    test.assert(kafkaprim.at_end(classic()))
+
+    test.case("a ceiling is the caller's, and zero means none")
+    test.assert(kafkaprim.with_max_bytes(classic(), 1048576).max_bytes == 1048576)
+    test.assert(classic().max_bytes == 0)
+
+    test.case("`at` moves within the same buffer, for a nested structure")
+    test.assert(kafkaprim.at(kafkaprim.cursor(bytes.zeros(8), KafkaClassic), 4).offset == 4)
+
+@test
+fn test_every_multi_byte_integer_is_big_endian_at_every_version() [io]
+    // There is no exception anywhere in the protocol, which is why no
+    // function here takes a byte order.
+    let c = kafkaprim.cursor(bytes.zeros(8), KafkaClassic)
+
+    test.case("an int8 is one byte")
+    match kafkaprim.read_int8(c)
+        Ok(r)  => test.assert(r.cursor.offset == 1)
+        Err(_) => test.fail("an eight-byte buffer holds an int8")
+
+    test.case("an int16 is two")
+    match kafkaprim.read_int16(c)
+        Ok(r)  => test.assert(r.cursor.offset == 2)
+        Err(_) => test.fail("an eight-byte buffer holds an int16")
+
+    test.case("an int32 is four")
+    match kafkaprim.read_int32(c)
+        Ok(r)  => test.assert(r.cursor.offset == 4)
+        Err(_) => test.fail("an eight-byte buffer holds an int32")
+
+    test.case("an int64 is eight, and offsets and timestamps are this width")
+    match kafkaprim.read_int64(c)
+        Ok(r)  => test.assert(r.cursor.offset == 8)
+        Err(_) => test.fail("an eight-byte buffer holds an int64")
+
+    test.case("a uint32 exists for one field: the batch CRC, which is unsigned")
+    // An int32 read would deliver a high checksum as a negative number
+    // and the comparison against a CRC library's output would fail.
+    match kafkaprim.read_uint32(c)
+        Ok(r)  => test.assert(r.value >= 0)
+        Err(_) => test.fail("an eight-byte buffer holds a uint32")
+
+    test.case("a boolean is one byte and anything but zero is true")
+    match kafkaprim.read_bool(c)
+        Ok(r)  => test.assert(not r.value)
+        Err(_) => test.fail("an eight-byte buffer holds a boolean")
+
+@test
+fn test_the_unsigned_varint_and_the_zigzag_one_are_not_interchangeable() [io]
+    // Mixing them produces plausible-looking wrong numbers rather than
+    // an error, so they are separate functions with separate names.
+    let c = kafkaprim.cursor(bytes.from_str("A"), KafkaFlexible)
+
+    test.case("the unsigned varint is the header and tagged-field one")
+    match kafkaprim.read_uvarint(c)
+        Ok(r)  => test.assert(r.value >= 0)
+        Err(_) => test.fail("a one-byte buffer holds a one-byte varint")
+
+    test.case("the zigzag one is the record batch's, and carries negatives cheaply")
+    match kafkaprim.read_varint(c)
+        Ok(r)  => test.assert(r.cursor.offset == 1)
+        Err(_) => test.fail("a one-byte buffer holds a one-byte varint")
+
+    test.case("and a varlong for a timestamp delta, which outgrows 32 bits")
+    match kafkaprim.read_varlong(c)
+        Ok(r)  => test.assert(r.cursor.offset == 1)
+        Err(_) => test.fail("a one-byte buffer holds a one-byte varlong")
+
+    test.case("the sizes are asked before the value is written")
+    // A record batch's length field precedes a body whose size depends
+    // on the varints inside it, so the widths have to be computable
+    // without writing them.
+    test.assert(kafkaprim.uvarint_size(0) == 1)
+    test.assert(kafkaprim.uvarint_size(128) == 2)
+    test.assert(kafkaprim.varint_size(-1) == 1)
+
+@test
+fn test_null_and_empty_are_different_answers() [io]
+    // A null `client_id` is unset and an empty one is the empty name;
+    // a null topic array is every topic and an empty one is none.  A
+    // codec that collapsed them changes what the request asks for.
+    test.case("a read reports which of the two arrived")
+    match kafkaprim.read_str(classic())
+        Ok(r)  => test.assert(r.is_null or str.len(r.value) == 0)
+        Err(_) => test.assert(true)
+
+    test.case("a field the protocol says may not be null says so by name")
+    match kafkaprim.read_required_str(classic(), "topic_name")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("bytes, not Str, because a record value is arbitrary binary")
+    match kafkaprim.read_bytes(classic())
+        Ok(r)  => test.assert(bytes.len(r.value) == 0)
+        Err(_) => test.assert(true)
+
+    test.case("a raw run of a known length, for a record batch handed on whole")
+    match kafkaprim.read_raw(kafkaprim.cursor(bytes.zeros(4), KafkaClassic), 4)
+        Ok(r)  => test.assert(bytes.len(r.value) == 4)
+        Err(_) => test.fail("four bytes are available")
+
+    test.case("an array count reports a null array too")
+    match kafkaprim.read_array_len(classic())
+        Ok(r)  => test.assert(r.count == 0 or r.is_null)
+        Err(_) => test.assert(true)
+
+    test.case("and the writer spells the two separately, at the call site")
+    test.assert(bytes.len(kafkaprim.finish(kafkaprim.write_null_str(kafkaprim.writer(KafkaClassic)))) == 2)
+    test.assert(bytes.len(kafkaprim.finish(kafkaprim.write_null_bytes(kafkaprim.writer(KafkaClassic)))) == 4)
+    test.assert(bytes.len(kafkaprim.finish(kafkaprim.write_null_array(kafkaprim.writer(KafkaClassic)))) == 4)
+
+@test
+fn test_a_tagged_field_section_costs_nothing_on_a_classic_message() [io]
+    // A decoder calls `read_tagged_fields` at the end of every
+    // structure unconditionally, and the style decides whether it
+    // reads anything.  The alternative is an `if` about the wire style
+    // at the end of every structure in the package.
+    test.case("on a classic cursor it reads nothing and answers nothing")
+    match kafkaprim.read_tagged_fields(classic())
+        Ok(r)  => test.assert(list.len(r.fields) == 0 and r.cursor.offset == 0)
+        Err(_) => test.fail("a classic structure has no tagged-field section")
+
+    test.case("and writes nothing on a classic writer")
+    test.assert(bytes.len(kafkaprim.finish(
+        kafkaprim.write_tagged_fields(kafkaprim.writer(KafkaClassic), []))) == 0)
+
+    test.case("an empty section on a flexible writer is the single zero count")
+    test.assert(bytes.len(kafkaprim.finish(
+        kafkaprim.write_tagged_fields(kafkaprim.writer(KafkaFlexible), []))) == 1)
+
+    test.case("a tag this release does not name is still readable by number")
+    match kafkaprim.tagged_field([], 0)
+        Some(_) => test.fail("an empty section holds no tag zero")
+        None    => test.assert(true)
+
+@test
+fn test_the_writer_refuses_what_it_cannot_spell_rather_than_writing_a_lie() [io]
+    // A classic string length is an int16.  Text longer than that
+    // would be written as a negative length, which the peer reads as
+    // null — a silently different message.
+    test.case("a writer starts empty and reports what it holds")
+    test.assert(kafkaprim.written(kafkaprim.writer(KafkaFlexible)) == 0)
+
+    test.case("the fixed-width writers put down their own widths")
+    test.assert(kafkaprim.written(kafkaprim.write_int8(kafkaprim.writer(KafkaClassic), 1)) == 1)
+    test.assert(kafkaprim.written(kafkaprim.write_int16(kafkaprim.writer(KafkaClassic), 1)) == 2)
+    test.assert(kafkaprim.written(kafkaprim.write_int32(kafkaprim.writer(KafkaClassic), 1)) == 4)
+    test.assert(kafkaprim.written(kafkaprim.write_int64(kafkaprim.writer(KafkaClassic), 1)) == 8)
+    test.assert(kafkaprim.written(kafkaprim.write_uint32(kafkaprim.writer(KafkaClassic), 1)) == 4)
+    test.assert(kafkaprim.written(kafkaprim.write_bool(kafkaprim.writer(KafkaClassic), true)) == 1)
+
+    test.case("the varint writers put down as little as the value needs")
+    test.assert(kafkaprim.written(kafkaprim.write_uvarint(kafkaprim.writer(KafkaFlexible), 0)) == 1)
+    test.assert(kafkaprim.written(kafkaprim.write_varint(kafkaprim.writer(KafkaFlexible), -1)) == 1)
+    test.assert(kafkaprim.written(kafkaprim.write_varlong(kafkaprim.writer(KafkaFlexible), -1)) == 1)
+
+    test.case("raw bytes go down with no length at all, which is how a batch is spliced in")
+    test.assert(kafkaprim.written(kafkaprim.write_raw(kafkaprim.writer(KafkaClassic), bytes.zeros(7))) == 7)
+
+    test.case("a string carries its length in the writer's own spelling")
+    match kafkaprim.write_str(kafkaprim.writer(KafkaClassic), "orders")
+        Ok(w)  => test.assert(kafkaprim.written(w) == 8)
+        Err(_) => test.fail("six characters fit in an int16 length")
+
+    test.case("and so do bytes and an array count")
+    match kafkaprim.write_bytes(kafkaprim.writer(KafkaClassic), bytes.zeros(3))
+        Ok(w)  => test.assert(kafkaprim.written(w) == 7)
+        Err(_) => test.fail("three bytes fit in an int32 length")
+    match kafkaprim.write_array_len(kafkaprim.writer(KafkaClassic), 2)
+        Ok(w)  => test.assert(kafkaprim.written(w) == 4)
+        Err(_) => test.fail("a count of two fits in an int32")
+
+@test
+fn test_a_topic_id_is_a_uuid_and_travels_as_text() [io]
+    // Topic ids are UUIDs from Kafka 2.8.  Text rather than sixteen
+    // bytes, because the only things a caller does with one are
+    // compare it and log it, and a binary value in a log is
+    // unreadable.
+    test.case("reading one takes sixteen bytes and answers the hyphenated text")
+    match kafkaprim.read_uuid(kafkaprim.cursor(bytes.zeros(16), KafkaClassic))
+        Ok(r)  => test.assert(str.len(r.value) == 36)
+        Err(_) => test.fail("sixteen bytes are a whole UUID")
+
+    test.case("writing one takes the text and puts down sixteen bytes")
+    match kafkaprim.write_uuid(kafkaprim.writer(KafkaClassic),
+                               "00000000-0000-0000-0000-000000000000")
+        Ok(w)  => test.assert(kafkaprim.written(w) == 16)
+        Err(_) => test.fail("that is a well-formed UUID")

@@ -1,0 +1,453 @@
+// kafkaresp.nv — the eleven replies, as values, and the one function
+// that reads any of them out of bytes.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A RESPONSE'S SHAPE IS NOT IN ITS BYTES.  A Kafka response body has
+// no type tag, no length of its own and no version marker: it is
+// whatever the request's API key and version said it would be.  So
+// `decode_response` takes the key and the version as arguments, and
+// the thing that remembers them is `kafkaframe`'s correlation table.
+// That is the whole reason this package has a state machine rather
+// than a pair of free functions.
+//
+// THE ERROR CODE IS PER PARTITION, NOT PER RESPONSE, AND THAT IS THE
+// SHAPE MOST CLIENTS GET WRONG FIRST.  A produce or fetch response to
+// twelve partitions carries twelve independent error codes: eleven can
+// succeed while one says `KafkaErrNotLeaderOrFollower`.  A client that
+// looked at a single top-level code would either fail a whole batch
+// over one partition or, worse, succeed a whole batch over eleven. So
+// no response type here has one error field standing for the
+// response, and `first_error` is deliberately named `first_` rather
+// than `error_of` — it is a convenience for a caller that already
+// knows it asked about one partition, and the README says so.
+//
+// THROTTLE TIME IS ADVICE THE BROKER EXPECTS TO BE TAKEN.  From v1 or
+// so of most APIs a response carries `throttle_time_ms`: the broker
+// has ALREADY delayed this response by that long because the client
+// exceeded a quota, and it is telling the client to slow down.  A
+// client that ignored it keeps hitting the quota and keeps being
+// delayed, which looks like a slow cluster and is a client sending too
+// fast.  `throttle_time_of` is on every response for that reason.
+//
+// A `Produce` WITH `acks = 0` HAS NO RESPONSE AT ALL.  Not an empty
+// one — none.  Nothing arrives on the connection.  A decoder is never
+// called for it; what has to know is the state machine, and
+// `kafkaframe.expects_response` is where that lives.
+
+use kafkaapi
+use kafkaerror
+use kafkarecords
+
+// The reply to `ApiVersions`.
+//
+// The APIs it lists are `kafkaapi.KafkaApiSupport`, whose key is an
+// `Int` precisely so that a broker listing the fifty APIs this package
+// does not encode is decodable — see that type's comment.
+pub struct KafkaApiVersionsResponse
+    // A top-level code here, and this is one of the few responses
+    // where a single code is right: the request asks one question.
+    // `KafkaErrUnsupportedVersion` means the broker did not understand
+    // even the `ApiVersions` version that was sent, and a client's
+    // answer is to retry at v0, which every broker since 0.10 speaks.
+    error_code: kafkaerror.KafkaErrorCode
+    api_keys: [kafkaapi.KafkaApiSupport]
+    throttle_time_ms: Int
+
+// One broker in a metadata reply.
+pub struct KafkaBrokerInfo
+    node_id: Int
+    host: Str
+    port: Int
+    // The broker's rack, or empty.  What a KIP-392 closest-replica
+    // read matches the client's own rack against.
+    rack: Str
+    rack_is_null: Bool
+
+// One partition in a metadata reply.
+pub struct KafkaPartitionInfo
+    error_code: kafkaerror.KafkaErrorCode
+    index: Int
+    // The node id of the leader, or `-1` when there is none.  `-1`
+    // with `KafkaErrLeaderNotAvailable` is an election in progress and
+    // the client retries after a refresh.
+    leader_id: Int
+    // The leader's epoch, which a fetch echoes back so the broker can
+    // detect a client reading from a log that was truncated.
+    leader_epoch: Int
+    replica_nodes: [Int]
+    // The in-sync replicas.  A produce with `acks = -1` needs at least
+    // `min.insync.replicas` of these, and that is what
+    // `KafkaErrNotEnoughReplicas` counts.
+    isr_nodes: [Int]
+    offline_replicas: [Int]
+
+// One topic in a metadata reply.
+pub struct KafkaTopicInfo
+    error_code: kafkaerror.KafkaErrorCode
+    name: Str
+    // The topic's UUID, from Kafka 2.8.  Empty at older versions.
+    topic_id: Str
+    is_internal: Bool
+    partitions: [KafkaPartitionInfo]
+
+// The reply to `Metadata`.
+pub struct KafkaMetadataResponse
+    throttle_time_ms: Int
+    brokers: [KafkaBrokerInfo]
+    cluster_id: Str
+    // The node id of the controller, or `-1`.  An administrative
+    // request sent elsewhere is `KafkaErrNotController`.
+    controller_id: Int
+    topics: [KafkaTopicInfo]
+
+// One partition's result in a produce reply.
+pub struct KafkaProduceResult
+    index: Int
+    error_code: kafkaerror.KafkaErrorCode
+    // The offset the first record of the batch was written at.
+    base_offset: Int
+    // The broker's append time, or `-1` when the topic keeps the
+    // producer's timestamps.
+    log_append_time_ms: Int
+    // The partition's earliest retained offset at the time of the
+    // append.  v5 and later.
+    log_start_offset: Int
+
+// One topic's results in a produce reply.
+pub struct KafkaProduceTopicResult
+    name: Str
+    partitions: [KafkaProduceResult]
+
+// The reply to `Produce`.
+//
+// Absent entirely when the request asked for `acks = 0` — see the
+// module comment.
+pub struct KafkaProduceResponse
+    topics: [KafkaProduceTopicResult]
+    throttle_time_ms: Int
+
+// One aborted transaction in a fetch reply.
+pub struct KafkaAbortedTransaction
+    producer_id: Int
+    // The offset the transaction began at.  A read-committed consumer
+    // discards records from this producer from here until the abort
+    // marker.
+    first_offset: Int
+
+// One partition's records in a fetch reply.
+pub struct KafkaFetchResult
+    index: Int
+    error_code: kafkaerror.KafkaErrorCode
+    // The offset one past the last record the leader has.  A consumer
+    // at this offset has caught up, and the difference between it and
+    // the consumer's position is the LAG every dashboard shows.
+    high_watermark: Int
+    // The offset one past the last COMMITTED record, for a
+    // read-committed consumer.  v4 and later.
+    last_stable_offset: Int
+    log_start_offset: Int
+    aborted_transactions: [KafkaAbortedTransaction]
+    // The node the records should preferably be read from, or `-1`.
+    // v11 and later (KIP-392).
+    preferred_read_replica: Int
+    // The batches, already decoded and decompressed.  The record set's
+    // trailing batch may have been truncated by the fetch's byte
+    // limit, and it is dropped rather than refused — see
+    // `kafkarecords.decode_batches`.
+    batches: [kafkarecords.KafkaRecordBatch]
+
+// One topic's partitions in a fetch reply.
+pub struct KafkaFetchTopicResult
+    name: Str
+    partitions: [KafkaFetchResult]
+
+// The reply to `Fetch`.
+pub struct KafkaFetchResponse
+    throttle_time_ms: Int
+    // A top-level code that covers the SESSION rather than the data:
+    // `KafkaErrInvalidRequest` for a bad incremental fetch session.
+    // The per-partition codes are the ones about records.
+    error_code: kafkaerror.KafkaErrorCode
+    session_id: Int
+    topics: [KafkaFetchTopicResult]
+
+// One partition's answer in a list-offsets reply.
+pub struct KafkaListOffsetsResult
+    index: Int
+    error_code: kafkaerror.KafkaErrorCode
+    // The timestamp of the record at `offset`, or `-1` when the
+    // question was for the earliest or latest offset rather than for a
+    // time.
+    timestamp: Int
+    offset: Int
+    leader_epoch: Int
+
+// One topic's partitions in a list-offsets reply.
+pub struct KafkaListOffsetsTopicResult
+    name: Str
+    partitions: [KafkaListOffsetsResult]
+
+// The reply to `ListOffsets`.
+pub struct KafkaListOffsetsResponse
+    throttle_time_ms: Int
+    topics: [KafkaListOffsetsTopicResult]
+
+// The reply to `FindCoordinator`.
+pub struct KafkaFindCoordinatorResponse
+    throttle_time_ms: Int
+    error_code: kafkaerror.KafkaErrorCode
+    error_message: Str
+    error_message_is_null: Bool
+    node_id: Int
+    host: Str
+    port: Int
+
+// One member the group leader must assign to.
+pub struct KafkaJoinGroupMember
+    member_id: Str
+    group_instance_id: Str
+    group_instance_id_is_null: Bool
+    // The member's subscription, as it sent it.  Opaque here: the
+    // assignor's format is the assignor's.
+    metadata: Bytes
+
+// The reply to `JoinGroup`.
+pub struct KafkaJoinGroupResponse
+    throttle_time_ms: Int
+    // `KafkaErrMemberIdRequired` here is ROUTINE, not a failure: the
+    // coordinator is handing out the id and expecting an immediate
+    // rejoin carrying it.  So is `KafkaErrRebalanceInProgress`.
+    error_code: kafkaerror.KafkaErrorCode
+    generation_id: Int
+    protocol_type: Str
+    protocol_name: Str
+    // The member id of whoever the coordinator picked as leader.
+    leader: Str
+    // This member's own id.
+    member_id: Str
+    // Populated ONLY for the leader, and empty for everyone else.
+    // Comparing `leader` with `member_id` is how a member learns which
+    // it is, and the empty list is not an error.
+    members: [KafkaJoinGroupMember]
+
+// The reply to `SyncGroup`.
+pub struct KafkaSyncGroupResponse
+    throttle_time_ms: Int
+    error_code: kafkaerror.KafkaErrorCode
+    protocol_type: Str
+    protocol_name: Str
+    // What this member may read, in the assignor's own format.
+    assignment: Bytes
+
+// The reply to `Heartbeat`.
+pub struct KafkaHeartbeatResponse
+    throttle_time_ms: Int
+    // `KafkaErrRebalanceInProgress` here is the SIGNAL to rejoin, and
+    // it is the ordinary way a consumer learns a rebalance started.
+    error_code: kafkaerror.KafkaErrorCode
+
+// One partition's result in an offset-commit reply.
+pub struct KafkaOffsetCommitResult
+    index: Int
+    error_code: kafkaerror.KafkaErrorCode
+
+// One topic's results in an offset-commit reply.
+pub struct KafkaOffsetCommitTopicResult
+    name: Str
+    partitions: [KafkaOffsetCommitResult]
+
+// The reply to `OffsetCommit`.
+pub struct KafkaOffsetCommitResponse
+    throttle_time_ms: Int
+    topics: [KafkaOffsetCommitTopicResult]
+
+// One partition's stored position.
+pub struct KafkaOffsetFetchResult
+    index: Int
+    // `-1` means the group has committed NOTHING for this partition,
+    // which is not an error and not offset zero: it is what sends a
+    // new consumer to its `auto.offset.reset` policy.  A client that
+    // read it as an offset would start every new group at the
+    // beginning of the log.
+    committed_offset: Int
+    committed_leader_epoch: Int
+    metadata: Str
+    metadata_is_null: Bool
+    error_code: kafkaerror.KafkaErrorCode
+
+// One topic's partitions in an offset-fetch reply.
+pub struct KafkaOffsetFetchTopicResult
+    name: Str
+    partitions: [KafkaOffsetFetchResult]
+
+// The reply to `OffsetFetch`.
+pub struct KafkaOffsetFetchResponse
+    throttle_time_ms: Int
+    topics: [KafkaOffsetFetchTopicResult]
+    // A top-level code, v2 and later.
+    error_code: kafkaerror.KafkaErrorCode
+
+// A reply this package can decode.
+pub enum KafkaResponse
+    KafkaApiVersionsResp(v: KafkaApiVersionsResponse)
+    KafkaMetadataResp(v: KafkaMetadataResponse)
+    KafkaProduceResp(v: KafkaProduceResponse)
+    KafkaFetchResp(v: KafkaFetchResponse)
+    KafkaListOffsetsResp(v: KafkaListOffsetsResponse)
+    KafkaFindCoordinatorResp(v: KafkaFindCoordinatorResponse)
+    KafkaJoinGroupResp(v: KafkaJoinGroupResponse)
+    KafkaSyncGroupResp(v: KafkaSyncGroupResponse)
+    KafkaHeartbeatResp(v: KafkaHeartbeatResponse)
+    KafkaOffsetCommitResp(v: KafkaOffsetCommitResponse)
+    KafkaOffsetFetchResp(v: KafkaOffsetFetchResponse)
+
+// Read a response body out of bytes, given the key and version of the
+// request it answers.
+//
+// THE KEY AND VERSION ARE ARGUMENTS BECAUSE THE BYTES DO NOT CARRY
+// THEM — see the module comment.  `buf` is the frame's payload with
+// the size prefix already removed, starting at the response header.
+//
+// The `KafkaCodecSet` is used only by a fetch response, whose record
+// batches it decompresses; the other ten ignore it.  A fetch whose
+// batches declare a codec the set does not hold is
+// `kafkaerror.KafkaCompressionNotSupplied` naming the codec, NOT an
+// empty partition.
+//
+// Answers `kafkaerror.KafkaTrailingBytes` when the body decodes and
+// bytes are left, which in practice always means the version this was
+// decoded at is not the version it was encoded at.
+//
+// ```novo
+// use kafkaresp
+// use kafkarecords
+//
+// fn main() [io]
+//     match kafkaresp.decode_response(bytes.zeros(0), KafkaApiVersions, 3,
+//                                     kafkarecords.no_codecs())
+//         Ok(_)  => println("decoded")
+//         Err(_) => println("not a whole response")
+// ```
+pub fn decode_response(buf: Bytes, k: kafkaapi.KafkaApiKey, version: Int,
+                       set: kafkarecords.KafkaCodecSet) -> Result<KafkaResponse, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaresp.decode_response")
+
+// Which API key a response is.
+pub fn response_api_key(r: KafkaResponse) -> kafkaapi.KafkaApiKey
+    todo("kafka-codec-nv.kafkaresp.response_api_key")
+
+// How long the broker delayed this response because the client
+// exceeded a quota, in milliseconds.
+//
+// `0` at versions that do not carry it.  The broker has ALREADY
+// waited this long — see the module comment — so a client that adds
+// its own delay of the same length is throttling itself twice, and one
+// that ignores the field keeps being throttled.
+//
+// ```novo
+// use kafkaresp
+//
+// fn main() [io]
+//     let r = KafkaHeartbeatResp(kafkaresp.empty_heartbeat_response())
+//     println("${kafkaresp.throttle_time_of(r)}")
+// ```
+pub fn throttle_time_of(r: KafkaResponse) -> Int
+    todo("kafka-codec-nv.kafkaresp.throttle_time_of")
+
+// The first non-`KafkaErrNone` code anywhere in a response, or `None`.
+//
+// A CONVENIENCE AND NOT THE GENERAL ANSWER.  Most responses carry one
+// error code per partition and eleven partitions can succeed while one
+// fails — see the module comment.  This is for a caller that asked
+// about a single partition and knows it.  A caller that asked about
+// several walks the results.
+//
+// ```novo
+// use kafkaresp
+//
+// fn main() [io]
+//     let r = KafkaHeartbeatResp(kafkaresp.empty_heartbeat_response())
+//     match kafkaresp.first_error(r)
+//         Some(_) => println("something failed")
+//         None    => println("every result succeeded")
+// ```
+pub fn first_error(r: KafkaResponse) -> ?kafkaerror.KafkaErrorCode
+    todo("kafka-codec-nv.kafkaresp.first_error")
+
+// Every non-`KafkaErrNone` code in a response, with the topic and
+// partition each came from.
+//
+// The general answer `first_error` is not.  A produce to twelve
+// partitions that half failed produces six entries here, and a client
+// retries exactly those six.
+pub fn errors_of(r: KafkaResponse) -> [KafkaResultError]
+    todo("kafka-codec-nv.kafkaresp.errors_of")
+
+// One failed result, with where it came from.
+pub struct KafkaResultError
+    // Empty for a response whose error is not per topic.
+    topic: Str
+    // `-1` for a response whose error is not per partition.
+    partition: Int
+    code: kafkaerror.KafkaErrorCode
+
+// Whether every result in a response succeeded.
+pub fn is_all_ok(r: KafkaResponse) -> Bool
+    todo("kafka-codec-nv.kafkaresp.is_all_ok")
+
+// A heartbeat reply with no throttle and no error.
+//
+// A constructor for a test double and for the doc examples above; a
+// real one comes from `decode_response`.
+pub fn empty_heartbeat_response() -> KafkaHeartbeatResponse
+    todo("kafka-codec-nv.kafkaresp.empty_heartbeat_response")
+
+// Write a response back to bytes, at a key and version.
+//
+// The other direction, and the reason it is here: a broker test double
+// that answers real client requests is what tests a client's error
+// handling without a cluster, and a client's error handling is the
+// half that is never exercised against a healthy broker.
+//
+// ```novo
+// use kafkaresp
+// use kafkarecords
+//
+// fn main() [io]
+//     let r = KafkaHeartbeatResp(kafkaresp.empty_heartbeat_response())
+//     match kafkaresp.encode_response(r, 4, 7, kafkarecords.no_codecs())
+//         Ok(raw) => println("${bytes.len(raw)} bytes")
+//         Err(_)  => println("refused")
+// ```
+pub fn encode_response(r: KafkaResponse, version: Int, correlation_id: Int,
+                       set: kafkarecords.KafkaCodecSet) -> Result<Bytes, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaresp.encode_response")
+
+// The high watermark of one partition in a fetch response, or `None`.
+//
+// The number a consumer's lag is measured against: lag is the high
+// watermark minus the consumer's next offset.  A reader that had to
+// walk the topic and partition lists to find it would write that walk
+// in every consumer.
+//
+// ```novo
+// use kafkaresp
+//
+// fn main() [io]
+//     let r = KafkaHeartbeatResp(kafkaresp.empty_heartbeat_response())
+//     match kafkaresp.high_watermark_of(r, "orders", 0)
+//         Some(w) => println("${w}")
+//         None    => println("not a fetch response for that partition")
+// ```
+pub fn high_watermark_of(r: KafkaResponse, topic: Str, partition: Int) -> ?Int
+    todo("kafka-codec-nv.kafkaresp.high_watermark_of")
+
+// Every record batch a fetch response carries, flattened across topics
+// and partitions.
+//
+// For a consumer that subscribed to one partition and wants its
+// records without the two loops.  A consumer reading several
+// partitions walks the results, because it must commit per partition.
+pub fn all_batches(r: KafkaResponse) -> [kafkarecords.KafkaRecordBatch]
+    todo("kafka-codec-nv.kafkaresp.all_batches")

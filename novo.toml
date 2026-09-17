@@ -1,0 +1,70 @@
+[package]
+name        = "kafka-codec-nv"
+version     = "0.0.1"
+description = "The Apache Kafka wire protocol as a codec that performs nothing: request and response encodings by API key and version for the eleven APIs a client needs to produce, fetch and belong to a consumer group, the KIP-482 flexible spelling with compact strings and tagged fields, v2 record batches with CRC-32C and a compression codec handed in as a value, and size-prefixed framing over a correlation table.  No socket.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, and this one is core all the way down: not one of the eight
+# modules declares an effect row.
+#
+# The bytes come from the caller.  `kafkaframe.feed` takes whatever a
+# socket read returned and `kafkaframe.send` answers bytes for the
+# caller to write; nothing here opens a socket, resolves a broker name
+# or waits.  That is what lets the same codec serve a producer, a
+# consumer, a broker test double and a protocol-aware proxy, and it is
+# what lets the version matrix be tested against captured frames with
+# no cluster running.
+#
+# Two things a Kafka codec is usually given that would each have cost
+# an effect, and how each arrives instead:
+#
+#   * THE CLOCK.  A record batch stamps a base timestamp and each
+#     record a delta from it, and a produce request carries a timeout.
+#     A `core` package may not read a clock, so every instant is a
+#     PARAMETER — `kafkarecords.record_at` takes the millisecond count
+#     the caller read.  The by-product is that a test encodes a batch
+#     at a fixed instant and gets the same bytes every time.
+#   * COMPRESSION.  The four codecs Kafka allows live in flate-nv,
+#     snappy-nv, lz4-nv and zstd-nv, and this package depends on none
+#     of them: a `KafkaCodecSet` is a struct of caller-supplied
+#     function pairs, so a program that only ever reads uncompressed
+#     topics links no compression library at all, and one that reads
+#     zstd chooses its own.  A batch whose codec is not in the set is
+#     `KafkaCompressionNotSupplied` rather than an empty batch.
+#
+# The client half — sockets, a producer's batching, group membership —
+# is kafka-nv, layer `host`, which depends on this package.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["kafka", "wire-protocol", "record-batch", "kip-482", "varint", "crc32c", "codec", "sans-io", "native-port"]
+repository  = "https://github.com/novolang/kafka-codec-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The Kafka wire protocol, and the record batch that carries its own checksum"
+
+[dependencies]
+# crc-nv, for one field, and it is not optional: a v2 record batch
+# carries a CRC-32C — the Castagnoli polynomial, not the CRC-32 of zip
+# and PNG — over everything after the checksum field, and a broker
+# refuses a produce request whose batch does not match.  crc-nv 0.1.4
+# publishes CRC-32C under its own name and keeps the running state in
+# an `Int`, so a batch assembled in pieces is checksummed in the same
+# pieces rather than being copied flat first.  Declaring the dependency
+# is what keeps a second CRC table out of this package;
+# `kafkarecords.batch_crc` and `kafkarecords.verify_crc` are the two
+# call sites.  crc-nv is `core`, so the layer rule holds.
+crc-nv = "^0.1"

@@ -1,0 +1,313 @@
+// kafkaapi.nv — the table: which requests this release encodes, at
+// which versions, in which spelling, behind which header.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// AN UNKNOWN API KEY IS A TYPED REFUSAL, NOT A SKIP.  `KafkaApiKey`
+// has an arm for each of the eleven requests this release encodes and
+// no arm for anything else, so there is no value that means "some
+// other Kafka request".  `api_key_of_number` answers
+// `kafkaerror.KafkaUnknownApiKey` carrying the number.  The
+// alternative — an `Unknown(Int)` arm — reads as tolerant and is the
+// opposite: every `match` in the package would grow a branch that
+// cannot do anything, and a decoder that met one would have to skip a
+// body whose length it cannot know, because a Kafka response body has
+// no length of its own.  The frame's size prefix covers the header and
+// the body together, so "skip the rest of the frame" and "lose the
+// stream" are the same action.  Refusing names the key in the message
+// instead, which is what tells a person that their broker sent
+// something this package has not been taught.
+//
+// THE OPPOSITE RULE HOLDS FOR ERROR CODES, and the contrast is the
+// point.  `kafkaerror.error_code_of_number` is total, because a client
+// chooses which request it sends and does not choose which error it is
+// told about.
+//
+// A VERSION IS NEGOTIATED, NOT ASSUMED.  `ApiVersions` is the one
+// request a client sends before it knows anything, and the broker's
+// reply is a list of (key, min, max) triples.  `negotiate` intersects
+// that with this package's own range and answers the highest version
+// both sides speak, or `kafkaerror.KafkaUnsupportedVersion` when the
+// ranges do not overlap.  A client that skipped this and sent its
+// newest version gets `KafkaErrUnsupportedVersion` back from a broker
+// one release older, which is the same outcome one round trip later
+// and with the connection already used.
+//
+// THE `ApiVersions` RESPONSE HEADER IS THE PROTOCOL'S ONE EXCEPTION,
+// AND IT IS A TRAP.  Every flexible response is preceded by a response
+// header v1, which carries a tagged-field section.  `ApiVersions` v3
+// is a flexible request and its response header is v0 — no tagged
+// fields — because the client sends `ApiVersions` before it knows
+// whether the broker understands flexible versions at all, and a
+// broker that answered with a v1 header would be unparseable by a
+// client that had guessed wrong.  A decoder that applied the general
+// rule reads one byte too many and every field after it is garbage.
+// `header_response_version` is where that fact lives, once.
+
+use kafkaerror
+use kafkaprim
+
+// A request this package can encode.
+//
+// Eleven arms and no twelfth: there is no value meaning "another
+// Kafka request".  See the module comment, and the README's "What is
+// not included" for the keys this release leaves out.
+//
+// ```novo
+// use kafkaapi
+//
+// fn main() [io]
+//     println(kafkaapi.api_key_name(KafkaFetch))          // Fetch
+// ```
+pub enum KafkaApiKey
+    // `0`.  Append records to partitions.
+    KafkaProduce
+    // `1`.  Read records from partitions.
+    KafkaFetch
+    // `2`.  The earliest and latest offsets of a partition, and the
+    // offset at a timestamp.
+    KafkaListOffsets
+    // `3`.  The cluster's brokers, topics, partitions and leaders.
+    // The request every client sends second, after `ApiVersions`.
+    KafkaMetadata
+    // `8`.  Store a consumer group's position.
+    KafkaOffsetCommit
+    // `9`.  Read a consumer group's stored position.
+    KafkaOffsetFetch
+    // `10`.  Which broker coordinates a group.
+    KafkaFindCoordinator
+    // `11`.  Enter a consumer group and be given a role in it.
+    KafkaJoinGroup
+    // `12`.  Tell the coordinator this member is alive.
+    KafkaHeartbeat
+    // `14`.  Receive the assignment the group's leader computed.
+    KafkaSyncGroup
+    // `18`.  Which API versions this broker speaks.  The request a
+    // client sends first, on every connection.
+    KafkaApiVersions
+
+// A closed range of versions, both ends included.
+pub struct KafkaVersionRange
+    min: Int
+    max: Int
+
+// One line of an `ApiVersions` response: a key number and the range
+// the broker speaks.
+//
+// The key is an `Int` and NOT a `KafkaApiKey`, and that is deliberate:
+// a broker lists every API it has, including the fifty this package
+// does not encode, and a decoder that refused the response because it
+// met key `29` could never complete a handshake.  An unknown key is a
+// refusal where a client CHOOSES the key; here the broker chooses, so
+// the number travels.
+pub struct KafkaApiSupport
+    key: Int
+    min_version: Int
+    max_version: Int
+
+// The number a key has on the wire.
+//
+// ```novo
+// use kafkaapi
+//
+// fn main() [io]
+//     println("${kafkaapi.api_key_number(KafkaApiVersions)}")    // 18
+// ```
+pub fn api_key_number(k: KafkaApiKey) -> Int
+    todo("kafka-codec-nv.kafkaapi.api_key_number")
+
+// The key a number denotes, or `kafkaerror.KafkaUnknownApiKey`.
+//
+// THE TYPED REFUSAL.  See the module comment for why this is not
+// total and `kafkaerror.error_code_of_number` is.
+//
+// ```novo
+// use kafkaapi
+//
+// fn main() [io]
+//     match kafkaapi.api_key_of_number(19)
+//         Ok(k)  => println(kafkaapi.api_key_name(k))
+//         Err(_) => println("CreateTopics is not encoded by this release")
+// ```
+pub fn api_key_of_number(n: Int) -> Result<KafkaApiKey, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaapi.api_key_of_number")
+
+// The name the Kafka protocol guide gives the key: `"Produce"`,
+// `"FindCoordinator"`, `"ApiVersions"`.
+pub fn api_key_name(k: KafkaApiKey) -> Str
+    todo("kafka-codec-nv.kafkaapi.api_key_name")
+
+// The versions of this API that THIS PACKAGE encodes and decodes.
+//
+// Narrower than the broker's range and narrower than the protocol's.
+// The floor is not zero for most keys, because the early versions of
+// several APIs carry a message format this package does not read —
+// see the README's "What is not included".
+//
+// ```novo
+// use kafkaapi
+//
+// fn main() [io]
+//     let r = kafkaapi.supported_versions(KafkaProduce)
+//     println("Produce v${r.min}..v${r.max}")
+// ```
+pub fn supported_versions(k: KafkaApiKey) -> KafkaVersionRange
+    todo("kafka-codec-nv.kafkaapi.supported_versions")
+
+// The first version of this API that uses the KIP-482 flexible
+// spelling.
+//
+// Different for every key, because each API was converted in the
+// release that happened to touch it: `Metadata` at v9, `Produce` at
+// v9, `Fetch` at v12, `Heartbeat` at v4, `ApiVersions` at v3.  There
+// is no cluster-wide flexible flag and no way to derive this from
+// anything — it is a table, and this is the table.
+pub fn flexible_from(k: KafkaApiKey) -> Int
+    todo("kafka-codec-nv.kafkaapi.flexible_from")
+
+// Whether a given version of this API uses the flexible spelling.
+//
+// ```novo
+// use kafkaapi
+//
+// fn main() [io]
+//     println("${kafkaapi.is_flexible(KafkaMetadata, 9)}")       // true
+//     println("${kafkaapi.is_flexible(KafkaMetadata, 8)}")       // false
+// ```
+pub fn is_flexible(k: KafkaApiKey, version: Int) -> Bool
+    todo("kafka-codec-nv.kafkaapi.is_flexible")
+
+// The wire style a given version of this API is written in.
+//
+// THE ONE PLACE THE QUESTION IS ASKED.  Every cursor and every writer
+// in the package is built from this, so no other module contains an
+// `if` about the spelling — see `kafkaprim`'s module comment.
+//
+// ```novo
+// use kafkaapi
+// use kafkaprim
+//
+// fn main() [io]
+//     let c = kafkaprim.cursor(bytes.from_str(""),
+//                              kafkaapi.wire_style(KafkaFetch, 12))
+//     println("${kafkaprim.remaining(c)}")
+// ```
+pub fn wire_style(k: KafkaApiKey, version: Int) -> kafkaprim.KafkaWireStyle
+    todo("kafka-codec-nv.kafkaapi.wire_style")
+
+// Which request header version precedes this request.
+//
+// `1` for a classic request — key, version, correlation id, client id
+// — and `2` for a flexible one, which is the same four fields plus a
+// tagged-field section.  Header v0, which has no client id, is used by
+// one request this package does not encode and so never answered here.
+pub fn header_request_version(k: KafkaApiKey, version: Int) -> Int
+    todo("kafka-codec-nv.kafkaapi.header_request_version")
+
+// Which response header version precedes this response.
+//
+// `0` for a classic response — a correlation id and nothing else —
+// and `1` for a flexible one, which adds a tagged-field section.
+//
+// THE EXCEPTION IS `ApiVersions`, which answers `0` at every version
+// including its flexible ones.  A client sends `ApiVersions` before
+// it knows what the broker speaks, so its response header could not
+// depend on the answer.  A decoder that applied the general rule reads
+// the tagged-field count that is not there and every subsequent field
+// is wrong.  See the module comment.
+//
+// ```novo
+// use kafkaapi
+//
+// fn main() [io]
+//     println("${kafkaapi.header_response_version(KafkaApiVersions, 3)}")   // 0
+//     println("${kafkaapi.header_response_version(KafkaMetadata, 9)}")      // 1
+// ```
+pub fn header_response_version(k: KafkaApiKey, version: Int) -> Int
+    todo("kafka-codec-nv.kafkaapi.header_response_version")
+
+// The highest version of a key that both this package and the broker
+// speak.
+//
+// Takes the `ApiVersions` response's list whole, including the keys
+// this package has no arm for, and looks this one up.  Answers
+// `kafkaerror.KafkaUnsupportedVersion` when the ranges do not overlap
+// or when the broker does not list the key at all — carrying this
+// package's own range, so the message can say what would have worked.
+//
+// ```novo
+// use kafkaapi
+//
+// fn main() [io]
+//     let broker = [KafkaApiSupport { key: 0, min_version: 0, max_version: 9 }]
+//     match kafkaapi.negotiate(KafkaProduce, broker)
+//         Ok(v)  => println("Produce v${v}")
+//         Err(_) => println("no version in common")
+// ```
+pub fn negotiate(k: KafkaApiKey, broker: [KafkaApiSupport]) -> Result<Int, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaapi.negotiate")
+
+// Negotiate every key this package encodes at once.
+//
+// What a client calls once per connection, right after `ApiVersions`,
+// so that the version it will use for each request is settled before
+// any of them is built.  Answers a `KafkaApiSupport` per key with
+// `min_version` and `max_version` both set to the chosen version, and
+// omits a key the broker and this package have no version in common
+// for — so a client can produce to a broker too old for the consumer
+// group APIs without being refused a connection.
+pub fn negotiate_all(broker: [KafkaApiSupport]) -> [KafkaApiSupport]
+    todo("kafka-codec-nv.kafkaapi.negotiate_all")
+
+// Whether a version of a key is one this package encodes.
+//
+// ```novo
+// use kafkaapi
+//
+// fn main() [io]
+//     println("${kafkaapi.supports(KafkaHeartbeat, 4)}")
+// ```
+pub fn supports(k: KafkaApiKey, version: Int) -> Bool
+    todo("kafka-codec-nv.kafkaapi.supports")
+
+// Refuse a version this package does not encode, naming the range it
+// does.
+//
+// Every encoder and decoder in the package starts with this call, so
+// the refusal is the same sentence wherever it comes from.
+pub fn check_version(k: KafkaApiKey, version: Int) -> ?kafkaerror.KafkaFault
+    todo("kafka-codec-nv.kafkaapi.check_version")
+
+// The names of the API keys this release deliberately does not
+// encode.
+//
+// `"LeaveGroup"`, `"DescribeGroups"`, `"ListGroups"`,
+// `"SaslHandshake"`, `"SaslAuthenticate"`, `"CreateTopics"`,
+// `"DeleteTopics"`, `"CreatePartitions"`, `"DescribeConfigs"`,
+// `"AlterConfigs"`, `"DeleteGroups"`, `"DeleteRecords"`,
+// `"OffsetForLeaderEpoch"`, `"InitProducerId"`,
+// `"AddPartitionsToTxn"`, `"AddOffsetsToTxn"`, `"EndTxn"`,
+// `"TxnOffsetCommit"`, `"WriteTxnMarkers"`, `"DescribeCluster"`,
+// `"DescribeProducers"`, `"ConsumerGroupHeartbeat"`.
+//
+// A function rather than a paragraph, so a program that generates a
+// capability report reads the same list the README does and the two
+// cannot drift.  Each of those numbers is `KafkaUnknownApiKey` from
+// `api_key_of_number`.
+//
+// ```novo
+// use kafkaapi
+//
+// fn main() [io]
+//     println("${list.len(kafkaapi.unencoded_api_keys())} keys are left out")
+// ```
+pub fn unencoded_api_keys() -> [Str]
+    todo("kafka-codec-nv.kafkaapi.unencoded_api_keys")
+
+// Every key this package does encode.
+//
+// What a client iterates to build the argument to `negotiate_all`, and
+// what a test iterates to assert that every key has a version range, a
+// flexible floor and a header version.
+pub fn all_api_keys() -> [KafkaApiKey]
+    todo("kafka-codec-nv.kafkaapi.all_api_keys")

@@ -1,0 +1,540 @@
+// kafkareq.nv — the eleven requests, as values, and the one function
+// that turns any of them into bytes.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// ONE ENUM AND ONE ENCODER, NOT ELEVEN ENCODERS.  `KafkaRequest` has
+// an arm per request and `encode_request` is the only way to get bytes
+// out of one.  The reason is the header: a request's bytes are a
+// header written in the message's own wire style followed by a body
+// written in the same style, and a package that published
+// `encode_metadata_request` beside `encode_produce_request` would be
+// publishing eleven chances to pair a body with a header at the wrong
+// version.  With one entry point the pairing happens once.
+//
+// A REQUEST VALUE CARRIES NO VERSION.  The version is an argument to
+// `encode_request`, alongside the header, because it is negotiated per
+// connection — `kafkaapi.negotiate` — and the same request value is
+// legitimately sent to two brokers at two versions.  A request struct
+// that had a version field would have to be rebuilt per broker, and a
+// client talking to a mixed-version cluster during an upgrade does
+// exactly that.
+//
+// FIELDS A VERSION DOES NOT HAVE ARE DROPPED, NOT REFUSED — EXCEPT
+// WHEN DROPPING THEM CHANGES THE MEANING.  Most request fields were
+// added over time, and encoding at an older version simply omits the
+// later ones: `Metadata` v0 has no `allow_auto_topic_creation`, and a
+// caller that set it gets the v0 broker's default.  That is the right
+// answer, because the alternative is refusing to talk to an older
+// broker over a field whose absence is harmless.  Three fields are not
+// like that, and `encode_request` refuses rather than dropping them:
+// a transactional id on a `Produce` below v3, a `rack_id` on a `Fetch`
+// below v11, and a group instance id on a `JoinGroup` below v5.  Each
+// of those changes where records go or which member is fenced, and
+// silently dropping one produces a working client that does the wrong
+// thing.  `kafkaerror.KafkaNotEncodable` names the field.
+//
+// THE RECORD BATCH IS ENCODED BY `kafkarecords` AND SPLICED IN.  A
+// produce request's partition data is a length-prefixed blob holding
+// whole record batches, so `encode_request` calls
+// `kafkarecords.encode_batch` and writes the result raw — which is
+// also why a produce request needs the caller's `KafkaCodecSet` and
+// the other ten do not.
+
+use kafkaapi
+use kafkaerror
+use kafkahdr
+use kafkarecords
+
+// Ask which API versions a broker speaks.
+//
+// The first request on every connection.  From v3 it also carries the
+// client's software name and version, which is what a broker's
+// `kafka-client-metrics` reports; both are ignored at v0 to v2.
+pub struct KafkaApiVersionsRequest
+    // A name like `"novo-kafka-nv"`.  Must match `[A-Za-z0-9.-]+` or
+    // the broker answers `KafkaErrInvalidRequest`.
+    client_software_name: Str
+    client_software_version: Str
+
+// Ask for the cluster's brokers, topics, partitions and leaders.
+pub struct KafkaMetadataRequest
+    // Which topics to describe.  An EMPTY list and a NULL list are
+    // different requests and the difference is the whole cluster: null
+    // means every topic, empty means none.  `metadata_request` takes
+    // the list and `metadata_for_all_topics` is the other one.
+    topics: [Str]
+    topics_is_null: Bool
+    // Whether the broker should create a topic that does not exist.
+    // v4 and later; dropped below that, where the broker's
+    // `auto.create.topics.enable` decides.
+    allow_auto_topic_creation: Bool
+    // Ask for the authorized operations on each topic.  v8 and later.
+    include_topic_authorized_operations: Bool
+
+// One partition's records in a produce request.
+pub struct KafkaProducePartition
+    index: Int
+    // The batches to append, in order.  Several are allowed and a
+    // producer that has been batching across a flush boundary sends
+    // several.
+    batches: [kafkarecords.KafkaRecordBatch]
+
+// One topic's partitions in a produce request.
+pub struct KafkaProduceTopic
+    name: Str
+    partitions: [KafkaProducePartition]
+
+// Append records to partitions.
+pub struct KafkaProduceRequest
+    // The transactional id, or empty.  v3 and later; a caller that
+    // sets it and encodes below v3 is REFUSED rather than silently
+    // producing outside its transaction — see the module comment.
+    transactional_id: Str
+    transactional_id_is_null: Bool
+    // How many replicas must acknowledge: `0` for none, `1` for the
+    // leader, `-1` for every in-sync replica.  `0` means the broker
+    // sends NO RESPONSE AT ALL, which is the one request in this
+    // package whose reply does not exist — see
+    // `kafkaframe.expects_response`.
+    acks: Int
+    // How long the broker may wait for the acknowledgements, in
+    // milliseconds.  A deadline the BROKER honours; the client's own
+    // deadline is `kafka-nv`'s business.
+    timeout_ms: Int
+    topics: [KafkaProduceTopic]
+
+// One partition's read position in a fetch request.
+pub struct KafkaFetchPartition
+    index: Int
+    // The leader epoch the client believes this partition is in, or
+    // `-1`.  What lets a broker answer
+    // `KafkaErrFencedLeaderEpoch` instead of serving records from a
+    // log that was truncated by a leader change.
+    current_leader_epoch: Int
+    fetch_offset: Int
+    // The earliest offset the client still needs, for a follower
+    // fetch.  `-1` for a consumer.
+    log_start_offset: Int
+    partition_max_bytes: Int
+
+// One topic's partitions in a fetch request.
+pub struct KafkaFetchTopic
+    name: Str
+    partitions: [KafkaFetchPartition]
+
+// Read records from partitions.
+pub struct KafkaFetchRequest
+    // `-1` for a consumer; a broker id for a follower replica.
+    replica_id: Int
+    // How long the broker may hold the request open waiting for
+    // `min_bytes`.  The LONG POLL: a fetch with `max_wait_ms` of 500
+    // and `min_bytes` of 1 is what makes a consumer's idle loop cost
+    // two round trips a second instead of thousands.
+    max_wait_ms: Int
+    min_bytes: Int
+    // The ceiling on the whole response.  v3 and later.  A broker
+    // truncates the last batch of a partition at this limit, which is
+    // why `kafkarecords.decode_batches` drops a trailing partial batch
+    // rather than refusing it.
+    max_bytes: Int
+    // `0` reads uncommitted records, `1` reads only committed ones.
+    // v4 and later.
+    isolation_level: Int
+    // The incremental fetch session (KIP-227), or `0` and `-1` for a
+    // full fetch.
+    session_id: Int
+    session_epoch: Int
+    topics: [KafkaFetchTopic]
+    // Partitions to remove from the session.  v7 and later.
+    forgotten_topics: [KafkaFetchTopic]
+    // The client's rack, for the closest-replica read of KIP-392.
+    // v11 and later; refused below that — see the module comment.
+    rack_id: Str
+
+// One partition's question in a list-offsets request.
+pub struct KafkaListOffsetsPartition
+    index: Int
+    current_leader_epoch: Int
+    // `-2` for the earliest retained offset, `-1` for the offset one
+    // past the last record, or a millisecond timestamp for the first
+    // offset at or after that time.  The three are one field and the
+    // sentinels are the protocol's.
+    timestamp: Int
+
+// One topic's partitions in a list-offsets request.
+pub struct KafkaListOffsetsTopic
+    name: Str
+    partitions: [KafkaListOffsetsPartition]
+
+// Ask where a partition starts, where it ends, or where a time is.
+pub struct KafkaListOffsetsRequest
+    replica_id: Int
+    // v2 and later.
+    isolation_level: Int
+    topics: [KafkaListOffsetsTopic]
+
+// Ask which broker coordinates a group or a transactional id.
+pub struct KafkaFindCoordinatorRequest
+    // The group id, or the transactional id.
+    key: Str
+    // `0` for a consumer group, `1` for a transaction.  v1 and later;
+    // v0 knows only groups.
+    key_type: Int
+
+// One assignment protocol a joining member offers.
+pub struct KafkaJoinGroupProtocol
+    // `"range"`, `"roundrobin"`, `"sticky"`, `"cooperative-sticky"`,
+    // or a name of the caller's own.  This package does not implement
+    // any of them: an assignor is the group LEADER's computation over
+    // the metadata below, and it belongs to whoever writes it.
+    name: Str
+    // The member's subscription, opaque here.  The format is the
+    // assignor's, and `kafka-nv` encodes the standard one.
+    metadata: Bytes
+
+// Enter a consumer group.
+pub struct KafkaJoinGroupRequest
+    group_id: Str
+    // How long the coordinator waits for a heartbeat before evicting
+    // this member.
+    session_timeout_ms: Int
+    // How long the coordinator waits for this member to rejoin during
+    // a rebalance.  v1 and later.
+    rebalance_timeout_ms: Int
+    // Empty on a first join, after which the coordinator answers
+    // `KafkaErrMemberIdRequired` with the id to use.  That refusal is
+    // routine and not a failure.
+    member_id: Str
+    // The static membership id of KIP-345, or empty.  v5 and later;
+    // refused below that, because a static member that silently joined
+    // as a dynamic one triggers the rebalance it exists to avoid.
+    group_instance_id: Str
+    group_instance_id_is_null: Bool
+    // `"consumer"` for a consumer group; another value for a
+    // non-consumer group using the same membership machinery.
+    protocol_type: Str
+    protocols: [KafkaJoinGroupProtocol]
+
+// One member's assignment, as computed by the group leader.
+pub struct KafkaSyncGroupAssignment
+    member_id: Str
+    // The assignment, opaque here for the same reason the join
+    // metadata is.
+    assignment: Bytes
+
+// Collect the assignment the leader computed.
+pub struct KafkaSyncGroupRequest
+    group_id: Str
+    generation_id: Int
+    member_id: Str
+    group_instance_id: Str
+    group_instance_id_is_null: Bool
+    // v5 and later.
+    protocol_type: Str
+    protocol_name: Str
+    // Empty for every member except the leader, which sends one entry
+    // per member.  A follower that sent assignments would be telling
+    // the coordinator what everybody else gets.
+    assignments: [KafkaSyncGroupAssignment]
+
+// Tell the coordinator this member is alive.
+pub struct KafkaHeartbeatRequest
+    group_id: Str
+    generation_id: Int
+    member_id: Str
+    group_instance_id: Str
+    group_instance_id_is_null: Bool
+
+// One partition's committed position.
+pub struct KafkaOffsetCommitPartition
+    index: Int
+    // THE NEXT OFFSET TO READ, not the last one read.  A consumer that
+    // commits the last offset it processed reprocesses one record per
+    // partition after every restart.
+    committed_offset: Int
+    // The leader epoch the offset was read in, or `-1`.  v6 and later.
+    committed_leader_epoch: Int
+    // Whatever the application wants to store beside the offset.
+    // Nullable, and the broker caps its length —
+    // `KafkaErrOffsetMetadataTooLarge`.
+    metadata: Str
+    metadata_is_null: Bool
+
+// One topic's partitions in an offset commit.
+pub struct KafkaOffsetCommitTopic
+    name: Str
+    partitions: [KafkaOffsetCommitPartition]
+
+// Store a group's positions.
+pub struct KafkaOffsetCommitRequest
+    group_id: Str
+    // The generation this member is committing in.  A commit carrying
+    // a stale generation is `KafkaErrIllegalGeneration`, which is what
+    // stops a member that was evicted mid-poll from overwriting the
+    // position of whoever took its partitions.
+    generation_id: Int
+    member_id: Str
+    group_instance_id: Str
+    group_instance_id_is_null: Bool
+    topics: [KafkaOffsetCommitTopic]
+
+// One topic in an offset-fetch request.
+pub struct KafkaOffsetFetchTopic
+    name: Str
+    partition_indexes: [Int]
+
+// Read a group's stored positions.
+pub struct KafkaOffsetFetchRequest
+    group_id: Str
+    // An EMPTY list and a NULL list differ here too: null asks for
+    // every partition the group has committed, empty asks for none.
+    // v2 and later for the null form.
+    topics: [KafkaOffsetFetchTopic]
+    topics_is_null: Bool
+    // Whether to wait for open transactions rather than answering
+    // `KafkaErrUnstableOffsetCommit`.  v7 and later.
+    require_stable: Bool
+
+// A request this package can encode.
+//
+// One arm per API key, and `encode_request` is the only way to bytes
+// — see the module comment.
+pub enum KafkaRequest
+    KafkaApiVersionsReq(v: KafkaApiVersionsRequest)
+    KafkaMetadataReq(v: KafkaMetadataRequest)
+    KafkaProduceReq(v: KafkaProduceRequest)
+    KafkaFetchReq(v: KafkaFetchRequest)
+    KafkaListOffsetsReq(v: KafkaListOffsetsRequest)
+    KafkaFindCoordinatorReq(v: KafkaFindCoordinatorRequest)
+    KafkaJoinGroupReq(v: KafkaJoinGroupRequest)
+    KafkaSyncGroupReq(v: KafkaSyncGroupRequest)
+    KafkaHeartbeatReq(v: KafkaHeartbeatRequest)
+    KafkaOffsetCommitReq(v: KafkaOffsetCommitRequest)
+    KafkaOffsetFetchReq(v: KafkaOffsetFetchRequest)
+
+// Which API key a request is.
+//
+// ```novo
+// use kafkareq
+// use kafkaapi
+//
+// fn main() [io]
+//     let r = KafkaApiVersionsReq(kafkareq.api_versions_request("novo-kafka-nv", "0.0.1"))
+//     println(kafkaapi.api_key_name(kafkareq.request_api_key(r)))
+// ```
+pub fn request_api_key(r: KafkaRequest) -> kafkaapi.KafkaApiKey
+    todo("kafka-codec-nv.kafkareq.request_api_key")
+
+// Turn a request into the bytes of a message body, header included.
+//
+// THE ONLY WAY TO BYTES.  Checks the version against
+// `kafkaapi.supported_versions`, builds a writer in the version's own
+// wire style, writes the header and then the body, and refuses a field
+// whose absence at this version would change the meaning — see the
+// module comment.
+//
+// The `KafkaCodecSet` is used only by a produce request, whose record
+// batches it compresses.  The other ten ignore it, and
+// `kafkarecords.no_codecs()` is the right argument for them.
+//
+// The result is NOT framed: `kafkaframe.frame` adds the four-byte
+// size prefix, because a caller that is building a pipelined write
+// wants the bodies before it decides how many go in one syscall.
+//
+// ```novo
+// use kafkareq
+// use kafkahdr
+// use kafkarecords
+//
+// fn main() [io]
+//     let h = kafkahdr.request_header(KafkaApiVersions, 3, 1, "novo-kafka-nv")
+//     let r = KafkaApiVersionsReq(kafkareq.api_versions_request("novo-kafka-nv", "0.0.1"))
+//     match kafkareq.encode_request(h, r, kafkarecords.no_codecs())
+//         Ok(raw) => println("${bytes.len(raw)} bytes")
+//         Err(_)  => println("refused")
+// ```
+pub fn encode_request(h: kafkahdr.KafkaRequestHeader, r: KafkaRequest,
+                      set: kafkarecords.KafkaCodecSet) -> Result<Bytes, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkareq.encode_request")
+
+// Whether this request, at this version, would be refused for a field
+// the version cannot carry.
+//
+// Asked before a connection is chosen, so a client talking to a
+// mixed-version cluster can route a transactional produce to a broker
+// that can take it rather than discovering the refusal at the encode.
+pub fn check_encodable(r: KafkaRequest, version: Int) -> ?kafkaerror.KafkaFault
+    todo("kafka-codec-nv.kafkareq.check_encodable")
+
+// ── constructors ─────────────────────────────────────────────────────
+
+// An `ApiVersions` request naming the client's software.
+//
+// ```novo
+// use kafkareq
+//
+// fn main() [io]
+//     println(kafkareq.api_versions_request("novo-kafka-nv", "0.0.1").client_software_name)
+// ```
+pub fn api_versions_request(name: Str, version: Str) -> KafkaApiVersionsRequest
+    todo("kafka-codec-nv.kafkareq.api_versions_request")
+
+// A `Metadata` request for named topics.
+//
+// ```novo
+// use kafkareq
+//
+// fn main() [io]
+//     println("${list.len(kafkareq.metadata_request(["orders"]).topics)}")
+// ```
+pub fn metadata_request(topics: [Str]) -> KafkaMetadataRequest
+    todo("kafka-codec-nv.kafkareq.metadata_request")
+
+// A `Metadata` request for EVERY topic in the cluster.
+//
+// The null-topics form.  Spelled as its own function because the
+// difference between it and `metadata_request([])` is the difference
+// between the whole cluster and nothing, and an empty list is what a
+// caller accidentally builds — see `KafkaMetadataRequest.topics`.
+//
+// ```novo
+// use kafkareq
+//
+// fn main() [io]
+//     println("${kafkareq.metadata_for_all_topics().topics_is_null}")   // true
+// ```
+pub fn metadata_for_all_topics() -> KafkaMetadataRequest
+    todo("kafka-codec-nv.kafkareq.metadata_for_all_topics")
+
+// A `Produce` request with an acknowledgement policy and a broker-side
+// timeout.
+//
+// `acks` of `0` means the broker sends no response; see
+// `KafkaProduceRequest.acks` and `kafkaframe.expects_response`.
+//
+// ```novo
+// use kafkareq
+//
+// fn main() [io]
+//     println("${kafkareq.produce_request(-1, 30000, []).acks}")
+// ```
+pub fn produce_request(acks: Int, timeout_ms: Int,
+                       topics: [KafkaProduceTopic]) -> KafkaProduceRequest
+    todo("kafka-codec-nv.kafkareq.produce_request")
+
+// A `Fetch` request from a consumer, with a long-poll window.
+//
+// ```novo
+// use kafkareq
+//
+// fn main() [io]
+//     println("${kafkareq.fetch_request(500, 1, 52428800, []).max_wait_ms}")
+// ```
+pub fn fetch_request(max_wait_ms: Int, min_bytes: Int, max_bytes: Int,
+                     topics: [KafkaFetchTopic]) -> KafkaFetchRequest
+    todo("kafka-codec-nv.kafkareq.fetch_request")
+
+// A `ListOffsets` request.
+pub fn list_offsets_request(topics: [KafkaListOffsetsTopic]) -> KafkaListOffsetsRequest
+    todo("kafka-codec-nv.kafkareq.list_offsets_request")
+
+// The `timestamp` sentinel meaning the earliest retained offset.
+//
+// `-2`.  A named function rather than a constant a caller copies,
+// because `-1` and `-2` are one transposition apart and the two
+// answers are the two ends of the log.
+//
+// ```novo
+// use kafkareq
+//
+// fn main() [io]
+//     println("${kafkareq.earliest_offset()}")           // -2
+// ```
+pub fn earliest_offset() -> Int
+    todo("kafka-codec-nv.kafkareq.earliest_offset")
+
+// The `timestamp` sentinel meaning one past the last record.
+//
+// `-1`.
+pub fn latest_offset() -> Int
+    todo("kafka-codec-nv.kafkareq.latest_offset")
+
+// A `FindCoordinator` request for a consumer group.
+pub fn find_coordinator_request(group_id: Str) -> KafkaFindCoordinatorRequest
+    todo("kafka-codec-nv.kafkareq.find_coordinator_request")
+
+// A `FindCoordinator` request for a transactional id.
+pub fn find_transaction_coordinator_request(transactional_id: Str) -> KafkaFindCoordinatorRequest
+    todo("kafka-codec-nv.kafkareq.find_transaction_coordinator_request")
+
+// A `JoinGroup` request with an empty member id.
+//
+// The first join.  The coordinator answers
+// `KafkaErrMemberIdRequired` carrying the id, and the member rejoins
+// with `with_member_id` — which is a routine two-round-trip handshake
+// and not a failure.
+//
+// ```novo
+// use kafkareq
+//
+// fn main() [io]
+//     let j = kafkareq.join_group_request("indexers", 45000, 300000, [])
+//     println(j.member_id)                               // (empty)
+// ```
+pub fn join_group_request(group_id: Str, session_timeout_ms: Int, rebalance_timeout_ms: Int,
+                          protocols: [KafkaJoinGroupProtocol]) -> KafkaJoinGroupRequest
+    todo("kafka-codec-nv.kafkareq.join_group_request")
+
+// The same join carrying the member id the coordinator assigned.
+pub fn with_member_id(j: KafkaJoinGroupRequest, member_id: Str) -> KafkaJoinGroupRequest
+    todo("kafka-codec-nv.kafkareq.with_member_id")
+
+// The same join as a static member (KIP-345).
+//
+// Refused below `JoinGroup` v5 — see the module comment.  A static
+// member that rejoins with the same instance id after a restart keeps
+// its partitions instead of triggering a rebalance, which is the whole
+// point and is lost silently if the field is dropped.
+pub fn with_group_instance_id(j: KafkaJoinGroupRequest, instance_id: Str) -> KafkaJoinGroupRequest
+    todo("kafka-codec-nv.kafkareq.with_group_instance_id")
+
+// A `SyncGroup` request from a FOLLOWER: no assignments.
+pub fn sync_group_request(group_id: Str, generation_id: Int,
+                          member_id: Str) -> KafkaSyncGroupRequest
+    todo("kafka-codec-nv.kafkareq.sync_group_request")
+
+// A `SyncGroup` request from the group LEADER, carrying one assignment
+// per member.
+//
+// Spelled separately because a follower that sent assignments would be
+// telling the coordinator what every other member gets, and the
+// difference between the two calls is which member this is.
+pub fn sync_group_as_leader(group_id: Str, generation_id: Int, member_id: Str,
+                            assignments: [KafkaSyncGroupAssignment]) -> KafkaSyncGroupRequest
+    todo("kafka-codec-nv.kafkareq.sync_group_as_leader")
+
+// A `Heartbeat` request.
+pub fn heartbeat_request(group_id: Str, generation_id: Int, member_id: Str) -> KafkaHeartbeatRequest
+    todo("kafka-codec-nv.kafkareq.heartbeat_request")
+
+// An `OffsetCommit` request.
+//
+// The offsets in it are the NEXT offsets to read — see
+// `KafkaOffsetCommitPartition.committed_offset`.
+pub fn offset_commit_request(group_id: Str, generation_id: Int, member_id: Str,
+                             topics: [KafkaOffsetCommitTopic]) -> KafkaOffsetCommitRequest
+    todo("kafka-codec-nv.kafkareq.offset_commit_request")
+
+// An `OffsetFetch` request for named topics.
+pub fn offset_fetch_request(group_id: Str,
+                            topics: [KafkaOffsetFetchTopic]) -> KafkaOffsetFetchRequest
+    todo("kafka-codec-nv.kafkareq.offset_fetch_request")
+
+// An `OffsetFetch` request for every partition the group has
+// committed.
+//
+// The null-topics form, spelled separately for the same reason
+// `metadata_for_all_topics` is.
+pub fn offset_fetch_all(group_id: Str) -> KafkaOffsetFetchRequest
+    todo("kafka-codec-nv.kafkareq.offset_fetch_all")

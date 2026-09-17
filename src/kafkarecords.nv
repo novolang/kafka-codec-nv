@@ -1,0 +1,620 @@
+// kafkarecords.nv — the v2 record batch: the header, the CRC-32C, the
+// attribute bits, the varint-encoded records inside, and the control
+// batches that carry no data at all.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A RECORD BATCH IS THE UNIT KAFKA STORES, NOT A RECORD.  A producer
+// sends a batch, the broker appends the batch, a consumer fetches
+// whole batches and unpacks them.  Everything inside one is relative
+// to the batch: a record carries an OFFSET DELTA from the batch's base
+// offset and a TIMESTAMP DELTA from the batch's base timestamp, both
+// as varints, both usually one byte.  That is the compression before
+// the compression, and it is why `absolute_offset` and
+// `absolute_timestamp` exist: a caller that read `record.offset_delta`
+// and reported it as the offset would report `0` for the first record
+// of every batch in the topic.
+//
+// THE CHECKSUM COVERS THE BATCH FROM AFTER ITSELF TO THE END.  The
+// CRC-32C — the Castagnoli polynomial, not the CRC-32 of zip — is at a
+// fixed place in the header and covers every byte after it, which
+// includes the attributes, the deltas, and the COMPRESSED record
+// bytes rather than the plain ones.  So the order of operations when
+// encoding is: build the records, compress them, fill in the header,
+// then checksum what is now there.  An implementation that checksummed
+// before compressing produces a batch every broker refuses.
+//
+// COMPRESSION IS DECLARED AND HANDED IN, NEVER LINKED.  The low three
+// bits of the attributes say which of five codecs the record bytes
+// are in.  The codecs themselves are flate-nv, snappy-nv, lz4-nv and
+// zstd-nv, and this package depends on NONE of them: a `KafkaCodecSet`
+// is a struct of caller-supplied `fn(Bytes) -> Result<Bytes, Str>`
+// pairs.
+//
+// Three things follow, and they are the reason for the shape:
+//
+//   * A program that only reads uncompressed topics links no
+//     compression library.  On a device that is the difference between
+//     a binary that fits and one that does not.
+//   * A program that reads a zstd topic chooses its own zstd.  A codec
+//     baked in here would be the one every consumer of this package
+//     pays for, forever, including the ones that wanted a different
+//     one.
+//   * A batch whose declared codec is absent from the set is
+//     `kafkaerror.KafkaCompressionNotSupplied` naming the codec — NOT
+//     an empty batch and not a skip.  A consumer that silently
+//     returned no records from a snappy partition would look like a
+//     consumer that had caught up.
+//
+// LZ4 HAS A KNOWN TRAP AND IT IS THE CALLER'S TO AVOID.  Kafka's LZ4
+// framing before message format v1 wrote an incorrect header checksum,
+// and brokers still accept both.  This package does not correct for
+// it: the codec functions receive exactly the bytes from the batch and
+// answer exactly the bytes that go in.  The README says so.
+//
+// A CONTROL BATCH CARRIES NO RECORDS A CONSUMER MAY SEE.  Bit 5 of the
+// attributes marks a batch as a transaction marker — a commit or an
+// abort written by the coordinator.  Its single record's key holds the
+// marker type.  A consumer that handed a control batch's contents to
+// an application would deliver a four-byte binary blob as if it were a
+// message, which is a bug every client has shipped once.
+// `is_control_batch` is the check, and it is public because a caller
+// that assembles its own fetch loop needs it.
+
+use kafkaerror
+use kafkaprim
+
+// Which codec a batch's record bytes are in.
+//
+// The number is the low three bits of the batch's attributes.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     println("${kafkarecords.compression_id(KafkaZstd)}")       // 4
+// ```
+pub enum KafkaCompression
+    // `0`.  The record bytes are as they were written.
+    KafkaNoCompression
+    // `1`.  DEFLATE in a gzip wrapper (RFC 1952).  flate-nv.
+    KafkaGzip
+    // `2`.  Snappy, in the framing Kafka uses for it.  snappy-nv.
+    KafkaSnappy
+    // `3`.  LZ4 frame format.  lz4-nv.  See the module comment for
+    // the header-checksum trap.
+    KafkaLz4
+    // `4`.  Zstandard (RFC 8878), allowed from message format v2 and
+    // broker 2.1.  zstd-nv.
+    KafkaZstd
+
+// One codec, as a pair of functions the caller supplies.
+//
+// Named function fields rather than a trait, because a trait with an
+// effect parameter would let a caller hand in a codec that reads a
+// file, and a `core` package that accepted one would have left its
+// budget.  These are pure by their type.
+pub struct KafkaCodec
+    // Plain bytes in, codec bytes out.  The `Str` on the error side is
+    // the codec's own message, passed through into
+    // `kafkaerror.KafkaCodecFailed` unchanged.
+    compress: fn(Bytes) -> Result<Bytes, Str>
+    // Codec bytes in, plain bytes out.
+    decompress: fn(Bytes) -> Result<Bytes, Str>
+
+// Which codecs a caller has supplied.
+//
+// Four optional slots and no fifth: `KafkaNoCompression` needs no
+// function, so a set that is entirely empty still reads and writes
+// every uncompressed topic.
+pub struct KafkaCodecSet
+    gzip: ?KafkaCodec
+    snappy: ?KafkaCodec
+    lz4: ?KafkaCodec
+    zstd: ?KafkaCodec
+
+// A record's header: a name and bytes.
+//
+// Kafka calls these "headers"; they are the per-record key/value pairs
+// an application attaches, and they are unrelated to the batch header
+// or to a request header.  The name is a `Str` and the value is
+// `Bytes`, which is what the protocol says.
+pub struct KafkaRecordHeader
+    key: Str
+    value: Bytes
+
+// One record inside a batch.
+//
+// Everything is relative to the batch — see the module comment.
+pub struct KafkaRecord
+    // Bits the protocol reserves and no release uses.  Carried so a
+    // decode-then-encode round trip is byte-identical.
+    attributes: Int
+    // Milliseconds after the batch's `base_timestamp`.
+    timestamp_delta: Int
+    // Records after the batch's `base_offset`.
+    offset_delta: Int
+    // The partitioning key.  Empty when `key_is_null`; the two are
+    // different and Kafka partitions a null key at random and a
+    // present key by its hash, so collapsing them changes where a
+    // record lands.
+    key: Bytes
+    key_is_null: Bool
+    // The payload.  Empty when `value_is_null`; a null value is a
+    // TOMBSTONE on a compacted topic, meaning "this key is deleted",
+    // and an empty value is a message that happens to have no bytes.
+    // A consumer that collapsed them would delete keys it meant to
+    // keep, or keep keys the producer deleted.
+    value: Bytes
+    value_is_null: Bool
+    headers: [KafkaRecordHeader]
+
+// What the attribute bits of a batch say.
+pub struct KafkaBatchAttributes
+    // Bits 0-2.
+    compression: KafkaCompression
+    // Bit 3.  False means the timestamps are the producer's
+    // (`CreateTime`); true means the broker overwrote them with its
+    // own arrival time (`LogAppendTime`), in which case every record's
+    // delta is zero and the batch's `max_timestamp` is the only real
+    // one.
+    log_append_time: Bool
+    // Bit 4.  The batch belongs to a transaction.
+    is_transactional: Bool
+    // Bit 5.  The batch is a transaction marker and carries no
+    // application data — see the module comment.
+    is_control: Bool
+    // Bit 6.  The batch carries a delete horizon for compaction.
+    // Broker-internal; carried so a round trip is byte-identical.
+    has_delete_horizon: Bool
+
+// A v2 record batch.
+//
+// The field order is the wire's, because a reader comparing this
+// against the protocol guide should be able to read down.
+pub struct KafkaRecordBatch
+    // The offset of the first record.  Set by the broker on append;
+    // `0` in a batch a producer is building.
+    base_offset: Int
+    // The leader epoch the batch was written in, or `-1`.  What
+    // `kafkaerror.KafkaErrFencedLeaderEpoch` is about.
+    partition_leader_epoch: Int
+    // Always `2` in this package.  Magic `0` and `1` are the pre-0.11
+    // message sets — see the README's "What is not included".
+    magic: Int
+    // CRC-32C over everything after this field.  See the module
+    // comment for what that includes and in which order.
+    crc: Int
+    attributes: KafkaBatchAttributes
+    // The offset delta of the LAST record, so a reader knows the
+    // batch's offset range without unpacking it.
+    last_offset_delta: Int
+    // Milliseconds since the Unix epoch.  A parameter everywhere in
+    // this package, never a clock read — see the manifest.
+    base_timestamp: Int
+    // The largest timestamp in the batch.
+    max_timestamp: Int
+    // The idempotent producer's id, or `-1`.
+    producer_id: Int
+    // The idempotent producer's epoch, or `-1`.
+    producer_epoch: Int
+    // The sequence number of the first record, or `-1`.  What
+    // `kafkaerror.KafkaErrOutOfOrderSequence` is about.
+    base_sequence: Int
+    // The records, already decompressed.
+    records: [KafkaRecord]
+
+// Which transaction marker a control batch carries.
+pub enum KafkaControlType
+    // `0`.  The transaction was aborted; a read-committed consumer
+    // discards its records.
+    KafkaControlAbort
+    // `1`.  The transaction was committed.
+    KafkaControlCommit
+    // A number no release names, carried rather than refused: a
+    // consumer that met one must skip the batch, and refusing would
+    // stop a partition on a marker written by a newer broker.
+    KafkaControlUnknown(type_id: Int)
+
+// A control batch's contents.
+pub struct KafkaControlBatch
+    control_type: KafkaControlType
+    // The coordinator epoch that wrote the marker.
+    coordinator_epoch: Int
+
+// A decoded batch, and how many bytes it occupied.
+pub struct KafkaBatchRead
+    batch: KafkaRecordBatch
+    // Bytes consumed, so a caller walking a fetch response's record
+    // set knows where the next batch starts.  A fetch response holds
+    // several batches back to back with no separator and no count.
+    bytes: Int
+
+// A codec set with nothing in it.
+//
+// The right value for a program that produces and consumes
+// uncompressed topics, and it links no compression library at all.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     let set = kafkarecords.no_codecs()
+//     match kafkarecords.codec_for(set, KafkaGzip)
+//         Some(_) => println("gzip is available")
+//         None    => println("no gzip — a gzip batch is refused by name")
+// ```
+pub fn no_codecs() -> KafkaCodecSet
+    todo("kafka-codec-nv.kafkarecords.no_codecs")
+
+// The same set with one codec supplied.
+//
+// Refuses `KafkaNoCompression`, which needs no functions and whose
+// slot does not exist.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     println("${kafkarecords.compression_name(KafkaSnappy)}")
+// ```
+pub fn with_codec(set: KafkaCodecSet, c: KafkaCompression,
+                  codec: KafkaCodec) -> Result<KafkaCodecSet, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkarecords.with_codec")
+
+// The codec for a compression, or `None`.
+//
+// `KafkaNoCompression` answers `None` too, and a caller that treated
+// that as "missing" would refuse every uncompressed batch — so the
+// encoders and decoders ask `needs_codec` first.
+pub fn codec_for(set: KafkaCodecSet, c: KafkaCompression) -> ?KafkaCodec
+    todo("kafka-codec-nv.kafkarecords.codec_for")
+
+// Whether this compression needs a codec function at all.
+//
+// False for `KafkaNoCompression` and true for the other four.
+pub fn needs_codec(c: KafkaCompression) -> Bool
+    todo("kafka-codec-nv.kafkarecords.needs_codec")
+
+// Which compressions the set can handle, including
+// `KafkaNoCompression`.
+//
+// What a producer consults before choosing a codec for a topic, and
+// what a report prints so an operator can see why a partition stalled.
+pub fn available_compressions(set: KafkaCodecSet) -> [KafkaCompression]
+    todo("kafka-codec-nv.kafkarecords.available_compressions")
+
+// The number the attributes carry for this compression.
+pub fn compression_id(c: KafkaCompression) -> Int
+    todo("kafka-codec-nv.kafkarecords.compression_id")
+
+// The compression a number denotes, or
+// `kafkaerror.KafkaUnknownCompression`.
+//
+// Refused rather than defaulted to none: a batch whose codec bits are
+// `5` is a batch this package cannot read, and treating it as
+// uncompressed would hand a caller compressed bytes as if they were a
+// message.
+pub fn compression_of_id(n: Int) -> Result<KafkaCompression, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkarecords.compression_of_id")
+
+// The name Kafka's own configuration uses: `"none"`, `"gzip"`,
+// `"snappy"`, `"lz4"`, `"zstd"`.
+//
+// The same spelling as `compression.type` in a broker or producer
+// configuration file, so a caller can read one and pass it through.
+pub fn compression_name(c: KafkaCompression) -> Str
+    todo("kafka-codec-nv.kafkarecords.compression_name")
+
+// The compression a configuration name denotes, or `None`.
+pub fn compression_named(name: Str) -> ?KafkaCompression
+    todo("kafka-codec-nv.kafkarecords.compression_named")
+
+// The sixteen attribute bits as a number.
+pub fn attributes_bits(a: KafkaBatchAttributes) -> Int
+    todo("kafka-codec-nv.kafkarecords.attributes_bits")
+
+// What a number's attribute bits say.
+//
+// Refuses only an unknown compression; the reserved bits are carried
+// rather than checked, because a broker that starts using bit 7 must
+// not stop this decoder.
+pub fn attributes_of_bits(n: Int) -> Result<KafkaBatchAttributes, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkarecords.attributes_of_bits")
+
+// Plain attributes: no compression, producer timestamps, not
+// transactional, not a control batch.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     println("${kafkarecords.attributes_bits(kafkarecords.plain_attributes())}")   // 0
+// ```
+pub fn plain_attributes() -> KafkaBatchAttributes
+    todo("kafka-codec-nv.kafkarecords.plain_attributes")
+
+// The same attributes with a compression codec declared.
+pub fn with_compression(a: KafkaBatchAttributes, c: KafkaCompression) -> KafkaBatchAttributes
+    todo("kafka-codec-nv.kafkarecords.with_compression")
+
+// A record with a key and a value, both present, no headers, and both
+// deltas zero.
+//
+// `append` is what sets the deltas, because they are relative to the
+// batch and a record does not know which batch it is going into.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     let r = kafkarecords.record(bytes.from_str("order-7"), bytes.from_str("{}"))
+//     println("${r.offset_delta}")                       // 0
+// ```
+pub fn record(key: Bytes, value: Bytes) -> KafkaRecord
+    todo("kafka-codec-nv.kafkarecords.record")
+
+// A record with no key.
+//
+// Null and not empty: Kafka partitions a record with no key at random
+// and one with a key by its hash, so which of the two a producer sends
+// decides where the record lands.
+pub fn record_without_key(value: Bytes) -> KafkaRecord
+    todo("kafka-codec-nv.kafkarecords.record_without_key")
+
+// A tombstone: a record with a key and a NULL value.
+//
+// On a compacted topic this is what deletes the key.  A separate
+// constructor because the difference between a null value and an empty
+// one is the difference between deleting a key and storing nothing
+// under it, and it should be visible at the call site rather than
+// carried in a boolean.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     let t = kafkarecords.tombstone(bytes.from_str("order-7"))
+//     println("${t.value_is_null}")                      // true
+// ```
+pub fn tombstone(key: Bytes) -> KafkaRecord
+    todo("kafka-codec-nv.kafkarecords.tombstone")
+
+// The same record with headers attached.
+pub fn with_headers(r: KafkaRecord, headers: [KafkaRecordHeader]) -> KafkaRecord
+    todo("kafka-codec-nv.kafkarecords.with_headers")
+
+// The same record stamped at an instant, in milliseconds since the
+// Unix epoch.
+//
+// THE CLOCK AS A PARAMETER.  A `core` package may not read one — see
+// the manifest — and the by-product is that a test encodes a batch at
+// a fixed instant and gets the same bytes every time.  The batch's
+// `base_timestamp` is set from the first record; later records become
+// deltas from it.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     let r = kafkarecords.record_at(
+//                 kafkarecords.record(bytes.from_str("k"), bytes.from_str("v")),
+//                 1789000000000)
+//     println("${r.timestamp_delta}")
+// ```
+pub fn record_at(r: KafkaRecord, unix_millis: Int) -> KafkaRecord
+    todo("kafka-codec-nv.kafkarecords.record_at")
+
+// An empty batch at a base offset and a base timestamp.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     let b = kafkarecords.batch(0, 1789000000000)
+//     println("${list.len(b.records)}")                  // 0
+// ```
+pub fn batch(base_offset: Int, base_timestamp_millis: Int) -> KafkaRecordBatch
+    todo("kafka-codec-nv.kafkarecords.batch")
+
+// The same batch with a record on the end.
+//
+// Computes the record's offset delta from the batch's length and its
+// timestamp delta from the batch's base timestamp, and updates
+// `last_offset_delta` and `max_timestamp`.  A caller that set the
+// deltas itself and appended would produce a batch whose header
+// disagrees with its contents, which a broker rejects as corrupt.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     let b = kafkarecords.append(kafkarecords.batch(0, 1789000000000),
+//                                 kafkarecords.record(bytes.from_str("k"),
+//                                                     bytes.from_str("v")))
+//     println("${b.last_offset_delta}")                  // 0
+// ```
+pub fn append(b: KafkaRecordBatch, r: KafkaRecord) -> KafkaRecordBatch
+    todo("kafka-codec-nv.kafkarecords.append")
+
+// The same batch with attributes.
+pub fn with_attributes(b: KafkaRecordBatch, a: KafkaBatchAttributes) -> KafkaRecordBatch
+    todo("kafka-codec-nv.kafkarecords.with_attributes")
+
+// The same batch marked as one idempotent producer's, with its id,
+// epoch and base sequence.
+//
+// The three fields travel together because a batch carrying one of
+// them and not the others is what
+// `kafkaerror.KafkaErrOutOfOrderSequence` is reporting.
+pub fn with_producer(b: KafkaRecordBatch, producer_id: Int, producer_epoch: Int,
+                     base_sequence: Int) -> KafkaRecordBatch
+    todo("kafka-codec-nv.kafkarecords.with_producer")
+
+// Encode a batch: records, then compression, then the header, then the
+// checksum.
+//
+// THE ORDER IS THE DESIGN — see the module comment.  Answers
+// `kafkaerror.KafkaCompressionNotSupplied` when the attributes declare
+// a codec the set does not hold, and `kafkaerror.KafkaCodecFailed`
+// carrying the codec's own message when the caller's function refuses.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     let b = kafkarecords.append(kafkarecords.batch(0, 1789000000000),
+//                                 kafkarecords.record(bytes.from_str("k"),
+//                                                     bytes.from_str("v")))
+//     match kafkarecords.encode_batch(b, kafkarecords.no_codecs())
+//         Ok(raw) => println("${bytes.len(raw)} bytes")
+//         Err(_)  => println("refused")
+// ```
+pub fn encode_batch(b: KafkaRecordBatch, set: KafkaCodecSet) -> Result<Bytes, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkarecords.encode_batch")
+
+// How many bytes `encode_batch` would produce.
+//
+// Asked before the batch is built, because a producer has to decide
+// whether one more record still fits under the broker's
+// `message.max.bytes` and the answer is not the sum of the record
+// sizes: the deltas are varints whose width depends on the batch's
+// own base values.
+pub fn batch_size(b: KafkaRecordBatch, set: KafkaCodecSet) -> Result<Int, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkarecords.batch_size")
+
+// Decode one batch at an offset.
+//
+// Verifies the CRC-32C before decoding anything else, so a corrupt
+// batch is `kafkaerror.KafkaBadCrc` rather than a varint error
+// somewhere inside it.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     match kafkarecords.decode_batch(bytes.zeros(0), 0, kafkarecords.no_codecs())
+//         Ok(r)  => println("${r.bytes}")
+//         Err(_) => println("not a whole batch")
+// ```
+pub fn decode_batch(buf: Bytes, offset: Int,
+                    set: KafkaCodecSet) -> Result<KafkaBatchRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkarecords.decode_batch")
+
+// Decode every batch in a fetch response's record set.
+//
+// A record set is batches back to back with no separator and no count,
+// and its LAST BATCH MAY BE PARTIAL: a broker truncates the set at the
+// fetch's byte limit rather than at a batch boundary. So a trailing
+// incomplete batch is DROPPED rather than refused — a consumer that
+// treated it as corruption would stall on every partition whose next
+// batch is larger than `max_bytes`, which is the one shape of stall
+// that looks like a broker fault and is not.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     match kafkarecords.decode_batches(bytes.zeros(0), kafkarecords.no_codecs())
+//         Ok(bs) => println("${list.len(bs)} batches")
+//         Err(_) => println("refused")
+// ```
+pub fn decode_batches(buf: Bytes,
+                      set: KafkaCodecSet) -> Result<[KafkaRecordBatch], kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkarecords.decode_batches")
+
+// The CRC-32C a batch's bytes should carry.
+//
+// Over everything after the checksum field, on the COMPRESSED record
+// bytes.  crc-nv's CRC-32C is what computes it — see the manifest.
+pub fn batch_crc(raw: Bytes) -> Result<Int, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkarecords.batch_crc")
+
+// Whether an encoded batch's checksum matches its contents.
+//
+// Answers `kafkaerror.KafkaBadCrc` carrying both numbers rather than
+// `false`, because a report that says which two values differed is
+// what distinguishes a truncated read from a corrupt log.
+pub fn verify_crc(raw: Bytes) -> Result<Bool, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkarecords.verify_crc")
+
+// The absolute offset of a record in a batch.
+//
+// `base_offset + offset_delta`.  A caller that reported the delta
+// would report `0` for the first record of every batch in the topic —
+// see the module comment.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     let b = kafkarecords.batch(41000, 1789000000000)
+//     let r = kafkarecords.record(bytes.from_str("k"), bytes.from_str("v"))
+//     println("${kafkarecords.absolute_offset(b, r)}")   // 41000
+// ```
+pub fn absolute_offset(b: KafkaRecordBatch, r: KafkaRecord) -> Int
+    todo("kafka-codec-nv.kafkarecords.absolute_offset")
+
+// The absolute timestamp of a record, in milliseconds since the Unix
+// epoch.
+//
+// `base_timestamp + timestamp_delta`, except on a batch whose
+// attributes say `log_append_time`: there every record has the
+// batch's `max_timestamp`, because the broker overwrote the
+// producer's timestamps with its own arrival time and the deltas are
+// all zero.  A caller that added the delta anyway would report the
+// right answer by accident and the wrong one the day a topic's
+// `message.timestamp.type` is changed.
+pub fn absolute_timestamp(b: KafkaRecordBatch, r: KafkaRecord) -> Int
+    todo("kafka-codec-nv.kafkarecords.absolute_timestamp")
+
+// The offset one past the batch's last record.
+//
+// What a consumer commits after processing a batch, and what it asks
+// for next.  Kafka's committed offset is the NEXT offset to read and
+// not the last one read, and a consumer that commits the last one
+// reprocesses one record after every restart.
+pub fn next_offset(b: KafkaRecordBatch) -> Int
+    todo("kafka-codec-nv.kafkarecords.next_offset")
+
+// Whether the batch is a transaction marker rather than data.
+//
+// A consumer that handed a control batch's contents to an application
+// would deliver a four-byte binary blob as if it were a message — see
+// the module comment.
+//
+// ```novo
+// use kafkarecords
+//
+// fn main() [io]
+//     println("${kafkarecords.is_control_batch(kafkarecords.batch(0, 0))}")   // false
+// ```
+pub fn is_control_batch(b: KafkaRecordBatch) -> Bool
+    todo("kafka-codec-nv.kafkarecords.is_control_batch")
+
+// What a control batch says.
+//
+// Refuses a batch that is not one.  An unrecognised marker type is
+// `KafkaControlUnknown` rather than a refusal, because a consumer must
+// skip a marker written by a newer broker rather than stop the
+// partition on it.
+pub fn control_of(b: KafkaRecordBatch) -> Result<KafkaControlBatch, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkarecords.control_of")
+
+// The size in bytes one record occupies inside a batch.
+//
+// The varint length prefix included.  What `batch_size` sums, and what
+// a producer's batching policy measures a record against.
+pub fn record_size(b: KafkaRecordBatch, r: KafkaRecord) -> Int
+    todo("kafka-codec-nv.kafkarecords.record_size")
+
+// A tagged-field-free encoding of one record, for a caller assembling
+// a batch itself.
+//
+// Public because the alternative for a producer that streams records
+// into a fixed-size buffer is to build the whole batch in memory
+// first, and a producer whose batch size is its memory ceiling cannot
+// do that.
+pub fn encode_record(b: KafkaRecordBatch, r: KafkaRecord,
+                     w: kafkaprim.KafkaWriter) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkarecords.encode_record")

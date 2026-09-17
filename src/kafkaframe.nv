@@ -1,0 +1,349 @@
+// kafkaframe.nv — the state machine: requests in, bytes out, bytes in,
+// responses out, and the table that remembers what each one was.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS IS THE MODULE THE PACKAGE EXISTS TO MAKE POSSIBLE.  Everything
+// else here is an encoder or a decoder; this is the thing that turns
+// them into a client without owning a socket.  A caller drives it with
+// four calls and performs the input and output itself:
+//
+//   * `send` takes a request and answers the framed bytes to write,
+//     plus the exchange with that request remembered;
+//   * `feed` takes whatever a socket read returned, however partial;
+//   * `drain` answers every complete response the buffer now holds;
+//   * `reset` throws the pending table away when the connection dies.
+//
+// Nothing in it waits, reads, writes or sleeps, which is what keeps
+// the package `core` and what lets a test drive a whole produce-fetch
+// cycle out of a byte array.
+//
+// A FRAME IS A FOUR-BYTE BIG-ENDIAN LENGTH AND THEN THAT MANY BYTES.
+// The length covers the header and the body together and excludes
+// itself.  That is the entire framing, in both directions, at every
+// version — which is why a decoder that loses its place cannot
+// resynchronise: there is no magic number and no delimiter to scan
+// for.  `kafkaerror.is_fatal_to_connection` is the function that says
+// so.
+//
+// THE PENDING TABLE IS NOT AN OPTIMISATION, IT IS THE ONLY WAY TO
+// DECODE AT ALL.  A response body's shape comes from the request's API
+// key and version, and the response carries neither.  So the exchange
+// keeps a correlation id against the key and version that were sent,
+// and `drain` looks each response up before decoding it.  A client
+// that sent one request at a time could keep two variables instead;
+// one that pipelines — which is the only way to get throughput out of
+// Kafka — cannot.
+//
+// ORDER IS GUARANTEED AND IS STILL CHECKED.  A broker answers one
+// connection's requests in the order they arrived, so the pending
+// table is a queue rather than a map.  The correlation id is checked
+// anyway, because a mismatch is the only evidence a client gets that
+// its view of the stream has diverged, and continuing after one
+// produces plausible values from the wrong bytes.
+//
+// `acks = 0` IS THE HOLE IN THE QUEUE.  A produce request with `acks`
+// of `0` gets no response — not an empty one, none — so `send` does
+// not add it to the pending table.  An exchange that queued it would
+// match the NEXT response against it and be wrong about every response
+// after that for the life of the connection.  `expects_response` is
+// the predicate, and it is public because it is a fact about the
+// protocol that a caller building its own loop needs.
+
+use kafkaapi
+use kafkaerror
+use kafkarecords
+use kafkareq
+use kafkaresp
+
+// A request that has been sent and not yet answered.
+pub struct KafkaPending
+    correlation_id: Int
+    key: kafkaapi.KafkaApiKey
+    version: Int
+
+// One connection's protocol state.
+//
+// No socket, no clock, no buffer ceiling that is not the caller's.
+pub struct KafkaExchange
+    // Sent with every request header.
+    client_id: Str
+    // The next correlation id to use.  Monotonic, and it wraps at the
+    // `int32` the field is, which a connection would have to send two
+    // billion requests to reach.
+    next_correlation_id: Int
+    // Which version to use per API key, as settled by
+    // `kafkaapi.negotiate_all` from the broker's `ApiVersions` reply.
+    // Empty before the handshake, in which case `send` uses this
+    // package's own minimum for the key — which every broker since
+    // 0.10 speaks, and which is what makes the `ApiVersions` request
+    // itself sendable.
+    versions: [kafkaapi.KafkaApiSupport]
+    // Requests awaiting a response, oldest first.
+    pending: [KafkaPending]
+    // Bytes read from the connection and not yet decoded.
+    inbox: Bytes
+    // The largest frame this exchange will believe.  A fetch response
+    // can legitimately be tens of megabytes and the length is a number
+    // the broker supplied, so the ceiling is the caller's.
+    max_frame_bytes: Int
+
+// The bytes to write, and the exchange that remembers the request.
+pub struct KafkaSendOut
+    exchange: KafkaExchange
+    // Framed and ready for a socket: the four-byte length is already
+    // on the front.
+    bytes: Bytes
+    // The correlation id this request was sent with, so a caller that
+    // keeps its own book of outstanding work can key on it.
+    correlation_id: Int
+    // False when the request expects no reply — a produce with
+    // `acks = 0`.  A caller that awaited one would wait forever.
+    expects_response: Bool
+
+// One decoded response and the request it answers.
+pub struct KafkaAnswered
+    correlation_id: Int
+    key: kafkaapi.KafkaApiKey
+    version: Int
+    response: kafkaresp.KafkaResponse
+
+// Everything the buffer held, and the exchange with those bytes
+// consumed.
+pub struct KafkaDrained
+    exchange: KafkaExchange
+    // In the order they arrived, which is the order the requests were
+    // sent.
+    answers: [KafkaAnswered]
+
+// A new exchange for a connection, naming the client.
+//
+// The client id is what a broker's logs and `kafka-client-metrics`
+// show, so a client that leaves it empty is one nobody can find when
+// it is the one holding a partition.
+//
+// ```novo
+// use kafkaframe
+//
+// fn main() [io]
+//     let x = kafkaframe.exchange("orders-indexer")
+//     println("${kafkaframe.pending_count(x)}")          // 0
+// ```
+pub fn exchange(client_id: Str) -> KafkaExchange
+    todo("kafka-codec-nv.kafkaframe.exchange")
+
+// The same exchange with a frame-size ceiling.
+//
+// ```novo
+// use kafkaframe
+//
+// fn main() [io]
+//     let x = kafkaframe.with_max_frame_bytes(kafkaframe.exchange("novo"), 104857600)
+//     println("${x.max_frame_bytes}")
+// ```
+pub fn with_max_frame_bytes(x: KafkaExchange, limit: Int) -> KafkaExchange
+    todo("kafka-codec-nv.kafkaframe.with_max_frame_bytes")
+
+// The same exchange with the versions a broker's `ApiVersions` reply
+// settled.
+//
+// What a client calls once, after the first response on a connection,
+// with `kafkaapi.negotiate_all` applied to the reply's list.  Every
+// later `send` uses those versions.
+//
+// ```novo
+// use kafkaframe
+//
+// fn main() [io]
+//     let x = kafkaframe.with_versions(kafkaframe.exchange("novo"), [])
+//     println("${list.len(x.versions)}")
+// ```
+pub fn with_versions(x: KafkaExchange, versions: [kafkaapi.KafkaApiSupport]) -> KafkaExchange
+    todo("kafka-codec-nv.kafkaframe.with_versions")
+
+// Which version this exchange will send a key at.
+//
+// The negotiated one when the handshake has happened, and this
+// package's own minimum for the key before it — which is what makes
+// the `ApiVersions` request sendable on a connection that knows
+// nothing.
+pub fn version_for(x: KafkaExchange, k: kafkaapi.KafkaApiKey) -> Int
+    todo("kafka-codec-nv.kafkaframe.version_for")
+
+// Build a request into framed bytes and remember it.
+//
+// THE FIRST OF THE FOUR CALLS.  Chooses the version, builds the
+// header, encodes the body, prepends the four-byte length, and adds
+// the request to the pending table — unless it expects no response,
+// in which case it does not, and the returned `expects_response` says
+// so.
+//
+// The `KafkaCodecSet` is the caller's compression, used only by a
+// produce request; `kafkarecords.no_codecs()` is right for the rest.
+//
+// ```novo
+// use kafkaframe
+// use kafkareq
+// use kafkarecords
+//
+// fn main() [io]
+//     let x = kafkaframe.exchange("orders-indexer")
+//     let r = KafkaApiVersionsReq(kafkareq.api_versions_request("novo-kafka-nv", "0.0.1"))
+//     match kafkaframe.send(x, r, kafkarecords.no_codecs())
+//         Ok(out) => println("write ${bytes.len(out.bytes)} bytes")
+//         Err(_)  => println("refused")
+// ```
+pub fn send(x: KafkaExchange, r: kafkareq.KafkaRequest,
+            set: kafkarecords.KafkaCodecSet) -> Result<KafkaSendOut, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaframe.send")
+
+// Hand the exchange bytes from the connection.
+//
+// THE SECOND CALL.  Takes whatever a read returned — a partial frame,
+// several frames, a frame and a half — and appends it.  Nothing is
+// decoded here, so `feed` cannot fail: a buffer that is too full is
+// found by `drain`, which is where a length is first believed.
+//
+// ```novo
+// use kafkaframe
+//
+// fn main() [io]
+//     let x = kafkaframe.feed(kafkaframe.exchange("novo"), bytes.zeros(0))
+//     println("${kafkaframe.buffered(x)}")               // 0
+// ```
+pub fn feed(x: KafkaExchange, chunk: Bytes) -> KafkaExchange
+    todo("kafka-codec-nv.kafkaframe.feed")
+
+// Decode every complete response the buffer holds.
+//
+// THE THIRD CALL.  Answers an empty list when no whole frame has
+// arrived, which is the ordinary case on a short read and is not an
+// error.  Each response is matched against the oldest pending request,
+// its correlation id checked, and its body decoded at that request's
+// key and version.
+//
+// Refuses `kafkaerror.KafkaCorrelationMismatch` when a response does
+// not answer the oldest outstanding request, and
+// `kafkaerror.KafkaFrameTooLarge` when a length exceeds the exchange's
+// ceiling.  Both are fatal to the connection —
+// `kafkaerror.is_fatal_to_connection` says which faults are.
+//
+// ```novo
+// use kafkaframe
+// use kafkarecords
+//
+// fn main() [io]
+//     let x = kafkaframe.exchange("novo")
+//     match kafkaframe.drain(x, kafkarecords.no_codecs())
+//         Ok(d)  => println("${list.len(d.answers)} responses")
+//         Err(_) => println("the connection is lost")
+// ```
+pub fn drain(x: KafkaExchange,
+             set: kafkarecords.KafkaCodecSet) -> Result<KafkaDrained, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaframe.drain")
+
+// Throw the pending table and the buffer away.
+//
+// THE FOURTH CALL, and the one a caller reaches for when the
+// connection dies.  The negotiated versions and the client id survive,
+// because they are facts about the broker rather than about the
+// socket, so a reconnect does not have to redo the `ApiVersions`
+// handshake against a broker it already asked.
+//
+// Answers the requests that were outstanding, so a caller can fail or
+// resend them — a producer resends, a consumer's fetch is simply
+// reissued at the same offset.
+//
+// ```novo
+// use kafkaframe
+//
+// fn main() [io]
+//     let lost = kafkaframe.reset(kafkaframe.exchange("novo"))
+//     println("${list.len(lost.abandoned)} requests were in flight")
+// ```
+pub fn reset(x: KafkaExchange) -> KafkaReset
+    todo("kafka-codec-nv.kafkaframe.reset")
+
+// A reset exchange and what was in flight when it happened.
+pub struct KafkaReset
+    exchange: KafkaExchange
+    // The requests that will never be answered.  A producer resends
+    // them; a consumer reissues its fetch at the same offset.
+    abandoned: [KafkaPending]
+
+// Whether a request expects a reply at all.
+//
+// False for exactly one thing: a `Produce` with `acks` of `0`.  Public
+// because it is a fact about the protocol rather than about this
+// implementation, and a caller writing its own loop has to know it —
+// see the module comment.
+//
+// ```novo
+// use kafkaframe
+// use kafkareq
+//
+// fn main() [io]
+//     let r = KafkaProduceReq(kafkareq.produce_request(0, 30000, []))
+//     println("${kafkaframe.expects_response(r)}")       // false
+// ```
+pub fn expects_response(r: kafkareq.KafkaRequest) -> Bool
+    todo("kafka-codec-nv.kafkaframe.expects_response")
+
+// How many requests are awaiting a response.
+//
+// A client's in-flight limit is measured against this.  Kafka's own
+// clients cap it at five when the producer is idempotent, because the
+// broker can only deduplicate that many batches per partition.
+pub fn pending_count(x: KafkaExchange) -> Int
+    todo("kafka-codec-nv.kafkaframe.pending_count")
+
+// The requests awaiting a response, oldest first.
+pub fn pending_requests(x: KafkaExchange) -> [KafkaPending]
+    todo("kafka-codec-nv.kafkaframe.pending_requests")
+
+// How many undecoded bytes the exchange is holding.
+//
+// What a caller watches to decide its read size, and what tells it
+// that a frame larger than the ceiling is accumulating.
+pub fn buffered(x: KafkaExchange) -> Int
+    todo("kafka-codec-nv.kafkaframe.buffered")
+
+// How many bytes the next complete frame occupies, or `None` when the
+// buffer does not hold a whole one yet.
+//
+// The framing question on its own, for a caller that wants to know
+// whether a `drain` would produce anything before it allocates for
+// one.
+//
+// ```novo
+// use kafkaframe
+//
+// fn main() [io]
+//     match kafkaframe.frame_length(bytes.zeros(2), 0, 104857600)
+//         Ok(_)  => println("maybe a whole frame")
+//         Err(_) => println("refused")
+// ```
+pub fn frame_length(buf: Bytes, offset: Int, max_bytes: Int) -> Result<?Int, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaframe.frame_length")
+
+// Put the four-byte big-endian length in front of a body.
+//
+// `kafkaframe.send` does this already; it is public for a caller that
+// built a body with `kafkareq.encode_request` and is assembling
+// several into one write.
+//
+// ```novo
+// use kafkaframe
+//
+// fn main() [io]
+//     println("${bytes.len(kafkaframe.frame(bytes.zeros(6)))}")   // 10
+// ```
+pub fn frame(body: Bytes) -> Bytes
+    todo("kafka-codec-nv.kafkaframe.frame")
+
+// Take the four-byte length off a frame, answering the body.
+//
+// Answers `kafkaerror.KafkaTruncated` when the buffer holds less than
+// the length claims.
+pub fn unframe(buf: Bytes, offset: Int, max_bytes: Int) -> Result<Bytes, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaframe.unframe")

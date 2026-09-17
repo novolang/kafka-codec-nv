@@ -1,0 +1,547 @@
+// kafkaprim.nv — the primitive types the Kafka protocol is written in,
+// and the two halves of a codec: a cursor that reads and a writer that
+// builds.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE PROTOCOL HAS TWO SPELLINGS OF EVERY VARIABLE-LENGTH FIELD, AND
+// WHICH ONE APPLIES IS A PROPERTY OF THE REQUEST VERSION.  Before
+// KIP-482 a string was an `int16` byte count followed by UTF-8, with
+// `-1` for null, and an array was an `int32` element count with `-1`
+// for null.  From the "flexible" version of each API onwards a string
+// is an unsigned varint holding the byte count PLUS ONE, with `0` for
+// null, and an array is an unsigned varint holding the element count
+// plus one.  The two encodings share no bytes and no sentinel.
+//
+// A codec that tracked this per field would get it wrong, because the
+// switch is per MESSAGE VERSION and applies to every field in the
+// message at once.  So `KafkaWireStyle` is carried by the cursor and
+// by the writer, `read_str` and `write_str` consult it, and no caller
+// of this module ever writes an `if` about it.  `kafkaapi.wire_style`
+// is what computes it from an API key and a version, and that is the
+// only place the question is asked.
+//
+// THE TAGGED-FIELD SECTION IS PART OF THE SAME CHANGE.  A flexible
+// message ends every structure — the header, the body, each element of
+// each array — with a tagged-field section: an unsigned varint count
+// followed by that many (tag, size, bytes) triples, tags ascending.
+// An unknown tag is SKIPPED by its declared size, which is what makes
+// the protocol extensible without a version bump, and it is why
+// `read_tagged_fields` hands the raw fields back rather than
+// discarding them: a client that re-encodes a structure it decoded
+// must put the unknown tags back or it silently strips whatever a
+// newer broker added.
+//
+// ZIGZAG IS THE RECORD BATCH'S, NOT THE HEADER'S.  Two different
+// variable-length integer encodings live in this protocol and they are
+// not interchangeable.  The tagged-field machinery and the compact
+// lengths use an UNSIGNED varint (`read_uvarint`).  The fields inside
+// a v2 record — the length, the timestamp delta, the offset delta, the
+// key and value lengths — use a ZIGZAG-encoded signed varint
+// (`read_varint`), because those are routinely small and routinely
+// negative.  Mixing the two produces plausible-looking wrong numbers
+// rather than an error, so they are separate functions with separate
+// names and neither is a default.
+//
+// EVERY READ ANSWERS A NEW CURSOR.  Nothing here mutates: a read
+// returns the value and the cursor positioned after it, so a decoder
+// that needs to look ahead and back off keeps the old cursor and
+// throws the new one away.  That is what lets `kafkaframe` ask "is a
+// whole frame here" without committing to decoding it.
+
+use kafkaerror
+
+// Which of the two spellings of the variable-length fields a message
+// uses.
+//
+// Not a property of a field, of a broker or of a connection: a
+// property of one message version.  See the module comment.
+//
+// ```novo
+// use kafkaprim
+//
+// fn main() [io]
+//     let c = kafkaprim.cursor(bytes.from_str(""), KafkaFlexible)
+//     println("${kafkaprim.remaining(c)}")
+// ```
+pub enum KafkaWireStyle
+    // Pre-KIP-482: `int16` string lengths, `int32` array counts, `-1`
+    // for null, and no tagged-field sections.
+    KafkaClassic
+    // KIP-482: unsigned-varint lengths holding count plus one, `0` for
+    // null, and a tagged-field section at the end of every structure.
+    KafkaFlexible
+
+// One tagged field, as it sat on the wire.
+//
+// Kept whole — tag and undecoded bytes — because a decoder that
+// discarded the tags it did not know would strip them from anything it
+// re-encoded.  See the module comment.
+pub struct KafkaTaggedField
+    // The tag number.  Ascending within a section; KIP-482 requires
+    // that and a decoder relies on it to skip.
+    tag: Int
+    // The field's bytes, exactly as they arrived, with the tag and the
+    // size already removed.
+    data: Bytes
+
+// A read position in a buffer, with the wire style the message uses.
+//
+// Immutable: every read answers a new one.
+pub struct KafkaCursor
+    // The whole buffer, not a slice of it, so an error can report an
+    // absolute offset a person can find in a packet capture.
+    buf: Bytes
+    // How far in the next read starts.
+    offset: Int
+    // Which spelling the variable-length fields use.
+    style: KafkaWireStyle
+    // The largest length this cursor will believe from the wire.  A
+    // fetch response can legitimately be tens of megabytes, so the
+    // ceiling is the caller's rather than a constant here; `0` means
+    // no ceiling.
+    max_bytes: Int
+
+// An integer, and the cursor after it.
+pub struct KafkaIntRead
+    cursor: KafkaCursor
+    value: Int
+
+// A string, and the cursor after it.
+pub struct KafkaStrRead
+    cursor: KafkaCursor
+    // The text.  Empty when `is_null`, which is NOT the same thing —
+    // see `read_str`.
+    value: Str
+    // Whether the wire said null rather than empty.
+    is_null: Bool
+
+// A byte string, and the cursor after it.
+pub struct KafkaBytesRead
+    cursor: KafkaCursor
+    value: Bytes
+    is_null: Bool
+
+// An array's element count, and the cursor after it.
+//
+// The elements themselves are read by the caller in a loop, because
+// their type differs per field and this module knows nothing about
+// any of them.
+pub struct KafkaLenRead
+    cursor: KafkaCursor
+    count: Int
+    // Whether the wire said a null array rather than an empty one.
+    // The protocol distinguishes them and several responses mean
+    // different things by each.
+    is_null: Bool
+
+// A tagged-field section, and the cursor after it.
+pub struct KafkaTagsRead
+    cursor: KafkaCursor
+    // Every field in the section, in the ascending tag order it
+    // arrived in, including the ones this release does not interpret.
+    fields: [KafkaTaggedField]
+
+// A buffer being built, with the wire style the message uses.
+//
+// Immutable in the same way the cursor is: every write answers a new
+// writer.
+pub struct KafkaWriter
+    out: Bytes
+    style: KafkaWireStyle
+
+// A cursor over a buffer.
+//
+// `max_bytes` of `0` means no ceiling.  A caller reading from a socket
+// sets it to whatever it is willing to allocate, because the lengths
+// in a Kafka frame are numbers the peer supplied.
+//
+// ```novo
+// use kafkaprim
+//
+// fn main() [io]
+//     let c = kafkaprim.cursor(bytes.zeros(2), KafkaClassic)
+//     println("${kafkaprim.remaining(c)}")                // 2
+// ```
+pub fn cursor(buf: Bytes, style: KafkaWireStyle) -> KafkaCursor
+    todo("kafka-codec-nv.kafkaprim.cursor")
+
+// The same cursor with a length ceiling.
+//
+// ```novo
+// use kafkaprim
+//
+// fn main() [io]
+//     let c = kafkaprim.with_max_bytes(kafkaprim.cursor(bytes.from_str(""), KafkaClassic),
+//                                      1048576)
+//     println("${c.max_bytes}")
+// ```
+pub fn with_max_bytes(c: KafkaCursor, max_bytes: Int) -> KafkaCursor
+    todo("kafka-codec-nv.kafkaprim.with_max_bytes")
+
+// A cursor at a given offset in the same buffer.
+//
+// What a decoder uses to hand a nested structure — a record batch
+// inside a produce request — to another module without copying the
+// bytes out.
+pub fn at(c: KafkaCursor, offset: Int) -> KafkaCursor
+    todo("kafka-codec-nv.kafkaprim.at")
+
+// How many bytes are left after the cursor.
+pub fn remaining(c: KafkaCursor) -> Int
+    todo("kafka-codec-nv.kafkaprim.remaining")
+
+// Whether the cursor is at the end of its buffer.
+//
+// What a decoder checks before deciding a message had trailing bytes
+// — see `kafkaerror.KafkaTrailingBytes`, which is almost always a
+// version mismatch rather than corruption.
+pub fn at_end(c: KafkaCursor) -> Bool
+    todo("kafka-codec-nv.kafkaprim.at_end")
+
+// Which wire style the cursor is reading.
+pub fn style_of(c: KafkaCursor) -> KafkaWireStyle
+    todo("kafka-codec-nv.kafkaprim.style_of")
+
+// ── fixed-width integers ─────────────────────────────────────────────
+
+// One signed byte.
+//
+// ```novo
+// use kafkaprim
+//
+// fn main() [io]
+//     match kafkaprim.read_int8(kafkaprim.cursor(bytes.from_str("A"), KafkaClassic))
+//         Ok(r)  => println("${r.value}")
+//         Err(_) => println("truncated")
+// ```
+pub fn read_int8(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_int8")
+
+// A big-endian signed 16-bit integer.
+//
+// Every multi-byte integer in this protocol is big-endian, in every
+// version, with no exception; the module never asks.
+pub fn read_int16(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_int16")
+
+// A big-endian signed 32-bit integer.
+pub fn read_int32(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_int32")
+
+// A big-endian signed 64-bit integer.
+//
+// Offsets and millisecond timestamps are this width, which is why the
+// package carries no separate timestamp type: a Kafka timestamp is an
+// `int64` count of milliseconds since the Unix epoch and `-1` means
+// "no timestamp".
+pub fn read_int64(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_int64")
+
+// A big-endian UNSIGNED 32-bit integer, as a non-negative `Int`.
+//
+// Exists for exactly one field: a record batch's CRC-32C, which is an
+// unsigned quantity that an `int32` read would deliver as a negative
+// number and a comparison against a checksum library's output would
+// then fail on.
+pub fn read_uint32(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_uint32")
+
+// A boolean, and the cursor after it.
+pub struct KafkaBoolRead
+    cursor: KafkaCursor
+    value: Bool
+
+// A boolean: one byte, `0` for false and anything else for true.
+//
+// "Anything else" is the protocol's rule and not a leniency here.
+pub fn read_bool(c: KafkaCursor) -> Result<KafkaBoolRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_bool")
+
+// A 16-byte UUID, as the 32-character lower-case hyphenated text.
+//
+// Topic ids are UUIDs from Kafka 2.8 onwards.  Text rather than bytes
+// because the only thing a caller does with one is compare it and log
+// it, and a 16-byte value in a log is unreadable.
+pub fn read_uuid(c: KafkaCursor) -> Result<KafkaStrRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_uuid")
+
+// ── variable-length integers ─────────────────────────────────────────
+
+// An unsigned varint: seven bits per byte, low group first, the high
+// bit meaning "another byte follows".
+//
+// THE HEADER AND TAGGED-FIELD ONE.  Not the record batch's — see the
+// module comment and `read_varint`.  Refused past ten bytes, because
+// a longer one cannot be a 64-bit value and a decoder that kept
+// reading would follow corruption to the end of the buffer.
+//
+// ```novo
+// use kafkaprim
+//
+// fn main() [io]
+//     match kafkaprim.read_uvarint(kafkaprim.cursor(bytes.from_str("A"), KafkaFlexible))
+//         Ok(r)  => println("${r.value}")             // 1
+//         Err(_) => println("not a varint")
+// ```
+pub fn read_uvarint(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_uvarint")
+
+// A zigzag-encoded signed varint, 32 bits wide.
+//
+// THE RECORD BATCH ONE.  Zigzag maps `0, -1, 1, -2, 2` to
+// `0, 1, 2, 3, 4`, so a small negative number costs one byte instead
+// of five.  A record's length, offset delta, key length and value
+// length are all this.
+pub fn read_varint(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_varint")
+
+// A zigzag-encoded signed varint, 64 bits wide.
+//
+// A record's timestamp delta, which is a millisecond count and
+// routinely exceeds 32 bits on a batch that spans time.
+pub fn read_varlong(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_varlong")
+
+// How many bytes an unsigned varint of this value occupies.
+//
+// Needed before the value is written, because a record batch's length
+// field precedes a body whose size depends on the lengths inside it.
+pub fn uvarint_size(v: Int) -> Int
+    todo("kafka-codec-nv.kafkaprim.uvarint_size")
+
+// How many bytes a zigzag signed varint of this value occupies.
+pub fn varint_size(v: Int) -> Int
+    todo("kafka-codec-nv.kafkaprim.varint_size")
+
+// ── strings, bytes and arrays ────────────────────────────────────────
+
+// A string, in whichever spelling the cursor's style says.
+//
+// `is_null` and an empty `value` are DIFFERENT ANSWERS and several
+// fields mean different things by each: a null `client_id` is
+// "unset", an empty one is "the empty name".  A caller that collapsed
+// them would send `Metadata` with an empty topic array — every topic
+// — where it meant a null one, or the reverse, and the two differ by
+// the whole cluster.
+//
+// ```novo
+// use kafkaprim
+//
+// fn main() [io]
+//     match kafkaprim.read_str(kafkaprim.cursor(bytes.from_str(""), KafkaClassic))
+//         Ok(r)  => println(r.value)
+//         Err(_) => println("truncated")
+// ```
+pub fn read_str(c: KafkaCursor) -> Result<KafkaStrRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_str")
+
+// A string that the protocol says may not be null.
+//
+// Answers `kafkaerror.KafkaNullNotAllowed` naming the field rather
+// than handing back an empty string, because the message a person
+// needs is "this broker sent a null topic name", not "the topic name
+// was empty".
+pub fn read_required_str(c: KafkaCursor, field: Str) -> Result<KafkaStrRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_required_str")
+
+// A byte string, in whichever spelling the cursor's style says.
+//
+// Bytes and not `Str`: a record key or value is arbitrary binary, and
+// a `Str` would make a protobuf payload unreadable.
+pub fn read_bytes(c: KafkaCursor) -> Result<KafkaBytesRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_bytes")
+
+// A byte string of a known length, taken raw.
+//
+// What a decoder uses for a record batch's body, which it hands to
+// `kafkarecords` rather than interpreting here.
+pub fn read_raw(c: KafkaCursor, n: Int) -> Result<KafkaBytesRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_raw")
+
+// An array's element count, in whichever spelling the cursor's style
+// says.
+//
+// The elements are the caller's to read: their type is different for
+// every field and this module knows about none of them.
+//
+// ```novo
+// use kafkaprim
+//
+// fn main() [io]
+//     match kafkaprim.read_array_len(kafkaprim.cursor(bytes.from_str(""), KafkaClassic))
+//         Ok(r)  => println("${r.count}")
+//         Err(_) => println("truncated")
+// ```
+pub fn read_array_len(c: KafkaCursor) -> Result<KafkaLenRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_array_len")
+
+// ── tagged fields ────────────────────────────────────────────────────
+
+// The tagged-field section at the end of a structure.
+//
+// On a `KafkaClassic` cursor this reads nothing, answers an empty
+// list and leaves the offset where it was — so a decoder calls it at
+// the end of every structure unconditionally and the style decides
+// whether it costs anything.  That is the point: the alternative is
+// an `if` about the wire style at the end of every structure in the
+// package.
+//
+// Refuses a section whose tags are not ascending
+// (`kafkaerror.KafkaBadTaggedFields`).  KIP-482 requires the order,
+// and a decoder that tolerated disorder could not tell a duplicated
+// tag from a corrupt size.
+//
+// ```novo
+// use kafkaprim
+//
+// fn main() [io]
+//     match kafkaprim.read_tagged_fields(kafkaprim.cursor(bytes.from_str(""), KafkaClassic))
+//         Ok(r)  => println("${list.len(r.fields)}")    // 0
+//         Err(_) => println("malformed section")
+// ```
+pub fn read_tagged_fields(c: KafkaCursor) -> Result<KafkaTagsRead, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.read_tagged_fields")
+
+// The bytes of one tag from a decoded section, or `None`.
+//
+// What a caller uses to read a tagged field this release does name —
+// and what it does NOT need for the ones it does not, because those
+// travel in the list and are written back untouched.
+pub fn tagged_field(fields: [KafkaTaggedField], tag: Int) -> ?Bytes
+    todo("kafka-codec-nv.kafkaprim.tagged_field")
+
+// ── writing ──────────────────────────────────────────────────────────
+
+// An empty writer in the given wire style.
+//
+// ```novo
+// use kafkaprim
+//
+// fn main() [io]
+//     let w = kafkaprim.writer(KafkaFlexible)
+//     println("${bytes.len(kafkaprim.finish(w))}")      // 0
+// ```
+pub fn writer(style: KafkaWireStyle) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.writer")
+
+// One signed byte.
+pub fn write_int8(w: KafkaWriter, v: Int) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_int8")
+
+// A big-endian signed 16-bit integer.
+pub fn write_int16(w: KafkaWriter, v: Int) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_int16")
+
+// A big-endian signed 32-bit integer.
+pub fn write_int32(w: KafkaWriter, v: Int) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_int32")
+
+// A big-endian signed 64-bit integer.
+pub fn write_int64(w: KafkaWriter, v: Int) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_int64")
+
+// A big-endian unsigned 32-bit integer.  The CRC field's writer.
+pub fn write_uint32(w: KafkaWriter, v: Int) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_uint32")
+
+// A boolean, as `0` or `1`.
+pub fn write_bool(w: KafkaWriter, v: Bool) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_bool")
+
+// A UUID, from the hyphenated text, as sixteen bytes.
+pub fn write_uuid(w: KafkaWriter, text: Str) -> Result<KafkaWriter, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.write_uuid")
+
+// An unsigned varint.
+pub fn write_uvarint(w: KafkaWriter, v: Int) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_uvarint")
+
+// A zigzag signed varint, 32 bits wide.
+pub fn write_varint(w: KafkaWriter, v: Int) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_varint")
+
+// A zigzag signed varint, 64 bits wide.
+pub fn write_varlong(w: KafkaWriter, v: Int) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_varlong")
+
+// A string, in whichever spelling the writer's style says.
+//
+// Refuses text whose UTF-8 is longer than an `int16` length can hold
+// on a `KafkaClassic` writer (`kafkaerror.KafkaNotEncodable`), rather
+// than writing a negative length that the peer reads as null.
+//
+// ```novo
+// use kafkaprim
+//
+// fn main() [io]
+//     match kafkaprim.write_str(kafkaprim.writer(KafkaClassic), "orders")
+//         Ok(w)  => println("${bytes.len(kafkaprim.finish(w))}")
+//         Err(_) => println("too long to encode")
+// ```
+pub fn write_str(w: KafkaWriter, v: Str) -> Result<KafkaWriter, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.write_str")
+
+// A null string: `-1` on a classic writer, `0` on a flexible one.
+//
+// A separate function rather than an optional argument, because null
+// and empty are different answers and the difference should be
+// visible at the call site — see `read_str`.
+pub fn write_null_str(w: KafkaWriter) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_null_str")
+
+// A byte string, in whichever spelling the writer's style says.
+pub fn write_bytes(w: KafkaWriter, v: Bytes) -> Result<KafkaWriter, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.write_bytes")
+
+// A null byte string.
+pub fn write_null_bytes(w: KafkaWriter) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_null_bytes")
+
+// Bytes with no length prefix at all.
+//
+// What splices an already-encoded record batch into a produce request,
+// and the reason `kafkarecords.encode_batch` can answer `Bytes`
+// instead of having to write into this module's writer.
+pub fn write_raw(w: KafkaWriter, v: Bytes) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_raw")
+
+// An array's element count, in whichever spelling the writer's style
+// says.
+pub fn write_array_len(w: KafkaWriter, count: Int) -> Result<KafkaWriter, kafkaerror.KafkaFault>
+    todo("kafka-codec-nv.kafkaprim.write_array_len")
+
+// A null array.
+pub fn write_null_array(w: KafkaWriter) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_null_array")
+
+// A tagged-field section.
+//
+// Writes nothing on a `KafkaClassic` writer, so a caller ends every
+// structure with this call and the style decides.  Sorts the fields
+// by tag, because KIP-482 requires ascending order and a caller that
+// decoded a structure and appended to its list would otherwise emit a
+// section a conforming decoder refuses.
+//
+// ```novo
+// use kafkaprim
+//
+// fn main() [io]
+//     let w = kafkaprim.write_tagged_fields(kafkaprim.writer(KafkaFlexible), [])
+//     println("${bytes.len(kafkaprim.finish(w))}")      // 1 — the zero count
+// ```
+pub fn write_tagged_fields(w: KafkaWriter, fields: [KafkaTaggedField]) -> KafkaWriter
+    todo("kafka-codec-nv.kafkaprim.write_tagged_fields")
+
+// The bytes written so far.
+pub fn finish(w: KafkaWriter) -> Bytes
+    todo("kafka-codec-nv.kafkaprim.finish")
+
+// How many bytes the writer holds.
+//
+// A produce request's caller checks this against the broker's
+// `message.max.bytes` before sending, because the alternative is
+// learning the answer as `KafkaErrMessageTooLarge` after the round
+// trip.
+pub fn written(w: KafkaWriter) -> Int
+    todo("kafka-codec-nv.kafkaprim.written")

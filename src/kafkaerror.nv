@@ -1,0 +1,442 @@
+// kafkaerror.nv — the two kinds of refusal: the code a broker puts in
+// a response, and the fault this codec raises about the bytes.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE TWO ARE NOT THE SAME THING, AND MERGING THEM LOSES THE ONE FACT
+// A CALLER NEEDS.  A broker error code arrives inside a well-formed
+// response: the bytes decoded, the protocol worked, and the cluster is
+// telling the client something about a topic or a group.  A codec
+// fault means the bytes did not decode at all, so there is nothing to
+// tell anybody about the topic.  A client answers the first by
+// refreshing metadata and retrying, and the second by dropping the
+// connection, because a decoder that lost its place in a stream cannot
+// find it again.
+//
+// AN UNRECOGNISED ERROR CODE IS NOT A REFUSAL.  Every Kafka release
+// adds codes, and a client that refused a code it had never seen could
+// not talk to a broker newer than itself.  So `KafkaErrOther` carries
+// the number, `is_retriable` answers `false` for it — an unknown error
+// is not known to be safe to retry — and the client surfaces the
+// number.  This is the opposite of the rule for an API key, where an
+// unknown key IS a refusal: a client chooses which request to send and
+// can only send one it can encode, whereas it does not choose which
+// error it is told about.
+//
+// THREE PREDICATES, BECAUSE THERE ARE THREE ANSWERS.  `is_retriable`
+// says whether sending the same bytes again could succeed.
+// `needs_metadata_refresh` says the client's map of which broker leads
+// which partition is stale, and retrying against the same broker will
+// fail identically until it is refetched.  `needs_coordinator_refresh`
+// says the same about the group coordinator, which is a separate
+// lookup with a separate cache and a separate staleness.  A client
+// that had only "retriable" would retry a `NOT_LEADER_OR_FOLLOWER`
+// against the broker that just said it is not the leader, forever.
+
+// An error code from a broker, as it appears in a response.
+//
+// The numbers are the ones in the Kafka protocol guide's error-code
+// table.  `KafkaErrNone` is `0` and means the operation succeeded; it
+// is an arm rather than an absence because the field is present in
+// every response whether or not anything went wrong.
+//
+// ```novo
+// use kafkaerror
+//
+// fn main() [io]
+//     println(kafkaerror.error_code_name(kafkaerror.error_code_of_number(6)))
+// ```
+pub enum KafkaErrorCode
+    // `0`.  The operation succeeded.
+    KafkaErrNone
+    // `-1` `UNKNOWN_SERVER_ERROR`.  The broker hit something it has no
+    // code for.  Never retriable, because nothing is known about it.
+    KafkaErrUnknownServer
+    // `1` `OFFSET_OUT_OF_RANGE`.  The requested offset is not in the
+    // partition's retained range.  A consumer answers it by resetting
+    // to the earliest or the latest offset, which is a policy the
+    // caller owns.
+    KafkaErrOffsetOutOfRange
+    // `2` `CORRUPT_MESSAGE`.  The broker's stored record failed its
+    // own checksum.
+    KafkaErrCorruptMessage
+    // `3` `UNKNOWN_TOPIC_OR_PARTITION`.  This broker does not host the
+    // partition — which for a new topic usually means the metadata is
+    // stale rather than that the topic is absent.
+    KafkaErrUnknownTopicOrPartition
+    // `4` `INVALID_FETCH_SIZE`.  The fetch size was negative.
+    KafkaErrInvalidFetchSize
+    // `5` `LEADER_NOT_AVAILABLE`.  The partition has no leader right
+    // now, usually mid-election.
+    KafkaErrLeaderNotAvailable
+    // `6` `NOT_LEADER_OR_FOLLOWER`.  This broker holds the partition
+    // but is not the leader.  The metadata is stale.
+    KafkaErrNotLeaderOrFollower
+    // `7` `REQUEST_TIMED_OUT`.  The broker could not satisfy the
+    // request within the timeout the request itself carried.
+    KafkaErrRequestTimedOut
+    // `8` `BROKER_NOT_AVAILABLE`.
+    KafkaErrBrokerNotAvailable
+    // `9` `REPLICA_NOT_AVAILABLE`.
+    KafkaErrReplicaNotAvailable
+    // `10` `MESSAGE_TOO_LARGE`.  The record batch exceeds the
+    // broker's `message.max.bytes`.  Not retriable: the same bytes
+    // will be refused again.
+    KafkaErrMessageTooLarge
+    // `12` `OFFSET_METADATA_TOO_LARGE`.  The string attached to an
+    // offset commit is longer than the broker allows.
+    KafkaErrOffsetMetadataTooLarge
+    // `13` `NETWORK_EXCEPTION`.  The connection was lost while the
+    // broker was processing the request, so whether it took effect is
+    // unknown.
+    KafkaErrNetworkException
+    // `14` `COORDINATOR_LOAD_IN_PROGRESS`.  The coordinator is reading
+    // the group's state and is not answering yet.
+    KafkaErrCoordinatorLoadInProgress
+    // `15` `COORDINATOR_NOT_AVAILABLE`.  There is no coordinator for
+    // this group right now.
+    KafkaErrCoordinatorNotAvailable
+    // `16` `NOT_COORDINATOR`.  This broker is not the coordinator for
+    // the group.  The coordinator cache is stale.
+    KafkaErrNotCoordinator
+    // `17` `INVALID_TOPIC_EXCEPTION`.  The topic name is illegal or
+    // reserved.
+    KafkaErrInvalidTopic
+    // `18` `RECORD_LIST_TOO_LARGE`.
+    KafkaErrRecordListTooLarge
+    // `19` `NOT_ENOUGH_REPLICAS`.  Fewer in-sync replicas than
+    // `min.insync.replicas`, and the produce asked for `acks = -1`.
+    // The write did NOT happen.
+    KafkaErrNotEnoughReplicas
+    // `20` `NOT_ENOUGH_REPLICAS_AFTER_APPEND`.  The write DID happen
+    // locally and may still be lost.  The distinction from `19` is the
+    // whole of what a producer needs to decide whether a retry
+    // duplicates.
+    KafkaErrNotEnoughReplicasAfterAppend
+    // `21` `INVALID_REQUIRED_ACKS`.  An `acks` value that is not `0`,
+    // `1` or `-1`.
+    KafkaErrInvalidRequiredAcks
+    // `22` `ILLEGAL_GENERATION`.  The member is using a generation the
+    // group has moved past: a rebalance happened.
+    KafkaErrIllegalGeneration
+    // `23` `INCONSISTENT_GROUP_PROTOCOL`.  The members of the group do
+    // not agree on an assignment protocol.
+    KafkaErrInconsistentGroupProtocol
+    // `24` `INVALID_GROUP_ID`.
+    KafkaErrInvalidGroupId
+    // `25` `UNKNOWN_MEMBER_ID`.  The coordinator has forgotten this
+    // member; it must rejoin with an empty member id.
+    KafkaErrUnknownMemberId
+    // `26` `INVALID_SESSION_TIMEOUT`.  Outside the broker's configured
+    // bounds.
+    KafkaErrInvalidSessionTimeout
+    // `27` `REBALANCE_IN_PROGRESS`.  The group is rebalancing and this
+    // member must rejoin.  A routine part of group membership rather
+    // than a failure.
+    KafkaErrRebalanceInProgress
+    // `28` `INVALID_COMMIT_OFFSET_SIZE`.
+    KafkaErrInvalidCommitOffsetSize
+    // `29` `TOPIC_AUTHORIZATION_FAILED`.
+    KafkaErrTopicAuthorizationFailed
+    // `30` `GROUP_AUTHORIZATION_FAILED`.
+    KafkaErrGroupAuthorizationFailed
+    // `31` `CLUSTER_AUTHORIZATION_FAILED`.
+    KafkaErrClusterAuthorizationFailed
+    // `32` `INVALID_TIMESTAMP`.  A record's timestamp is outside the
+    // topic's allowed difference from broker time.
+    KafkaErrInvalidTimestamp
+    // `33` `UNSUPPORTED_SASL_MECHANISM`.
+    KafkaErrUnsupportedSaslMechanism
+    // `34` `ILLEGAL_SASL_STATE`.  A request arrived out of the SASL
+    // handshake's order.
+    KafkaErrIllegalSaslState
+    // `35` `UNSUPPORTED_VERSION`.  The broker does not implement the
+    // version of the API the request used.  What `ApiVersions` exists
+    // to prevent.
+    KafkaErrUnsupportedVersion
+    // `36` `TOPIC_ALREADY_EXISTS`.
+    KafkaErrTopicAlreadyExists
+    // `37` `INVALID_PARTITIONS`.
+    KafkaErrInvalidPartitions
+    // `38` `INVALID_REPLICATION_FACTOR`.
+    KafkaErrInvalidReplicationFactor
+    // `41` `NOT_CONTROLLER`.  An administrative request reached a
+    // broker that is not the controller.
+    KafkaErrNotController
+    // `42` `INVALID_REQUEST`.  The broker could not parse the request,
+    // or it was self-contradictory.
+    KafkaErrInvalidRequest
+    // `43` `UNSUPPORTED_FOR_MESSAGE_FORMAT`.  The request needs a
+    // record format the topic is not using.
+    KafkaErrUnsupportedForMessageFormat
+    // `44` `POLICY_VIOLATION`.  A broker-side create policy refused it.
+    KafkaErrPolicyViolation
+    // `45` `OUT_OF_ORDER_SEQUENCE_NUMBER`.  An idempotent producer's
+    // sequence skipped: records were lost.
+    KafkaErrOutOfOrderSequence
+    // `46` `DUPLICATE_SEQUENCE_NUMBER`.  The broker has already
+    // appended this batch.
+    KafkaErrDuplicateSequence
+    // `47` `INVALID_PRODUCER_EPOCH`.  Another producer took this
+    // transactional id over.
+    KafkaErrInvalidProducerEpoch
+    // `56` `KAFKA_STORAGE_ERROR`.  The broker's log directory is
+    // offline.
+    KafkaErrStorageError
+    // `58` `SASL_AUTHENTICATION_FAILED`.
+    KafkaErrSaslAuthenticationFailed
+    // `68` `FENCED_LEADER_EPOCH`.  The request carried a leader epoch
+    // older than the partition's current one, so the metadata is stale.
+    KafkaErrFencedLeaderEpoch
+    // `69` `UNKNOWN_LEADER_EPOCH`.  The request carried a leader epoch
+    // newer than this broker knows about; it will catch up.
+    KafkaErrUnknownLeaderEpoch
+    // `70` `UNSUPPORTED_COMPRESSION_TYPE`.  The topic's format cannot
+    // carry the codec the batch declared — the error a producer using
+    // zstd against an old topic gets.
+    KafkaErrUnsupportedCompressionType
+    // `72` `OFFSET_NOT_AVAILABLE`.  The offset is not yet determinable
+    // because the leader has not finished initialising.
+    KafkaErrOffsetNotAvailable
+    // `73` `MEMBER_ID_REQUIRED`.  The coordinator has assigned a
+    // member id and the member must rejoin carrying it.  Routine on
+    // the first join of a modern group protocol.
+    KafkaErrMemberIdRequired
+    // `75` `GROUP_MAX_SIZE_REACHED`.
+    KafkaErrGroupMaxSizeReached
+    // `76` `FENCED_INSTANCE_ID`.  Another member is using this static
+    // group instance id.
+    KafkaErrFencedInstanceId
+    // `79` `UNSTABLE_OFFSET_COMMIT`.  A committed offset cannot be
+    // read yet because a transaction covering it is still open.
+    KafkaErrUnstableOffsetCommit
+    // Any code this release does not name, carrying the number.  NOT a
+    // refusal — see the module comment.
+    KafkaErrOther(code: Int)
+
+// Everything that can stop this codec from turning bytes into values
+// or values into bytes.
+//
+// None of these is something a broker said.  They are all statements
+// about bytes, a version, or an argument.
+pub enum KafkaFault
+    // The buffer ended in the middle of a field.  `want` is how many
+    // more bytes the field needed.  On a stream this is the ordinary
+    // "not yet" answer and the caller reads more; inside a frame whose
+    // length said it was complete it is corruption.
+    KafkaTruncated(offset: Int, want: Int, field: Str)
+    // A variable-length integer ran past ten bytes, or its
+    // continuation bits never terminated.
+    KafkaBadVarint(offset: Int, detail: Str)
+    // A length field was negative where the protocol allows no null,
+    // or a compact length was `0` where `0` means null and the field
+    // is not nullable.
+    KafkaNullNotAllowed(offset: Int, field: Str)
+    // A declared length exceeds the caller's ceiling.  The ceiling is
+    // the caller's because a Kafka fetch response can legitimately be
+    // tens of megabytes and the length is a number the wire supplied.
+    KafkaFrameTooLarge(declared: Int, limit: Int)
+    // A frame's bytes decoded and there were bytes left over.  A
+    // symptom of a version mismatch: the request was encoded at one
+    // version and the response read at another.
+    KafkaTrailingBytes(offset: Int, left: Int)
+    // An API key number no arm of `kafkaapi.KafkaApiKey` names.  THE
+    // TYPED REFUSAL — see `kafkaapi` and the README.  Carries the
+    // number so a log can say which.
+    KafkaUnknownApiKey(key: Int)
+    // The key is one this package encodes, but not at that version.
+    // Carries the range this package does support, so the message can
+    // say what to negotiate down to.
+    KafkaUnsupportedVersion(key: Int, version: Int, min: Int, max: Int)
+    // A correlation id in a response header matches no request this
+    // exchange sent.  The connection's ordering is broken and the only
+    // safe answer is to close it.
+    KafkaCorrelationMismatch(got: Int)
+    // A record batch's magic byte is not `2`.  Magic `0` and `1` are
+    // the pre-0.11 message sets, which this package does not read —
+    // see the README's "What is not included".
+    KafkaBadMagic(magic: Int)
+    // A record batch's CRC-32C over its own body does not match the
+    // value in its header.
+    KafkaBadCrc(want: Int, got: Int)
+    // A batch's attributes declared a compression codec whose number
+    // is not one of the five.
+    KafkaUnknownCompression(id: Int)
+    // A batch declared a codec and the `KafkaCodecSet` had no function
+    // for it.  THE FAULT THAT MAKES THE HANDED-IN CODECS VISIBLE: this
+    // package depends on no compression library, so a caller that
+    // reads a snappy topic without supplying a snappy codec is told
+    // exactly that rather than getting an empty batch.
+    KafkaCompressionNotSupplied(codec: Str)
+    // A caller-supplied compression function returned an error.  The
+    // text is the codec's own, passed through unchanged.
+    KafkaCodecFailed(codec: Str, detail: Str)
+    // A record batch's record count field disagrees with the number of
+    // records actually encoded in it.
+    KafkaRecordCountMismatch(declared: Int, found: Int)
+    // A value cannot be encoded: a string longer than an `int16` length
+    // can hold, an array longer than an `int32`, a timestamp that is
+    // not a millisecond count.
+    KafkaNotEncodable(field: Str, detail: Str)
+    // A tagged field section is malformed: tags out of ascending
+    // order, or a declared size that overruns the section.  KIP-482
+    // requires ascending tags, and a decoder that tolerated disorder
+    // could not skip an unknown tag safely.
+    KafkaBadTaggedFields(offset: Int, detail: Str)
+
+// The number a broker puts on the wire for this code.
+//
+// `KafkaErrOther` answers the number it carries, so the round trip
+// through `error_code_of_number` is the identity for every code,
+// named or not.
+//
+// ```novo
+// use kafkaerror
+//
+// fn main() [io]
+//     println("${kafkaerror.error_code_number(KafkaErrNotCoordinator)}")   // 16
+// ```
+pub fn error_code_number(c: KafkaErrorCode) -> Int
+    todo("kafka-codec-nv.kafkaerror.error_code_number")
+
+// The code a number denotes, or `KafkaErrOther` carrying it.
+//
+// Total, and deliberately so: a client that refused an unfamiliar
+// error code could not talk to a broker newer than itself.
+//
+// ```novo
+// use kafkaerror
+//
+// fn main() [io]
+//     println(kafkaerror.error_code_name(kafkaerror.error_code_of_number(999)))
+// ```
+pub fn error_code_of_number(n: Int) -> KafkaErrorCode
+    todo("kafka-codec-nv.kafkaerror.error_code_of_number")
+
+// The screaming-snake name the Kafka protocol guide gives the code:
+// `"NOT_LEADER_OR_FOLLOWER"`, `"REBALANCE_IN_PROGRESS"`.
+//
+// An unnamed code answers `"UNKNOWN_ERROR_CODE_<n>"`, so a log line is
+// still readable and still says which number arrived.
+//
+// ```novo
+// use kafkaerror
+//
+// fn main() [io]
+//     println(kafkaerror.error_code_name(KafkaErrRebalanceInProgress))
+// ```
+pub fn error_code_name(c: KafkaErrorCode) -> Str
+    todo("kafka-codec-nv.kafkaerror.error_code_name")
+
+// Whether sending the same request again could succeed.
+//
+// True for the transient cluster states — no leader, no coordinator,
+// a rebalance, a timeout, a load in progress.  False for everything
+// the client would have to change first, and false for
+// `KafkaErrOther`: an error nobody has classified is not known to be
+// safe to repeat.
+//
+// ```novo
+// use kafkaerror
+//
+// fn main() [io]
+//     println("${kafkaerror.is_retriable(KafkaErrLeaderNotAvailable)}")   // true
+//     println("${kafkaerror.is_retriable(KafkaErrMessageTooLarge)}")      // false
+// ```
+pub fn is_retriable(c: KafkaErrorCode) -> Bool
+    todo("kafka-codec-nv.kafkaerror.is_retriable")
+
+// Whether the client's partition-to-leader map is stale.
+//
+// True for `KafkaErrNotLeaderOrFollower`, `KafkaErrLeaderNotAvailable`,
+// `KafkaErrUnknownTopicOrPartition`, `KafkaErrFencedLeaderEpoch` and
+// `KafkaErrOffsetNotAvailable`.  A client that retried those against
+// the same broker without a `Metadata` request first would get the
+// same answer for as long as it kept trying.
+//
+// ```novo
+// use kafkaerror
+//
+// fn main() [io]
+//     println("${kafkaerror.needs_metadata_refresh(KafkaErrNotLeaderOrFollower)}")
+// ```
+pub fn needs_metadata_refresh(c: KafkaErrorCode) -> Bool
+    todo("kafka-codec-nv.kafkaerror.needs_metadata_refresh")
+
+// Whether the client's group-coordinator cache is stale.
+//
+// True for `KafkaErrNotCoordinator`, `KafkaErrCoordinatorNotAvailable`
+// and `KafkaErrCoordinatorLoadInProgress`.  A separate question from
+// the metadata one, because the coordinator is a separate lookup —
+// `FindCoordinator`, not `Metadata` — with its own cache and its own
+// staleness.
+//
+// ```novo
+// use kafkaerror
+//
+// fn main() [io]
+//     println("${kafkaerror.needs_coordinator_refresh(KafkaErrNotCoordinator)}")
+// ```
+pub fn needs_coordinator_refresh(c: KafkaErrorCode) -> Bool
+    todo("kafka-codec-nv.kafkaerror.needs_coordinator_refresh")
+
+// Whether the operation was refused because the caller lacks
+// permission.
+//
+// The four `*_AUTHORIZATION_FAILED` codes and
+// `KafkaErrSaslAuthenticationFailed`.  Separated because they are the
+// set a client must never retry and must surface to a person: a
+// permission that is missing at one o'clock is missing at two.
+//
+// ```novo
+// use kafkaerror
+//
+// fn main() [io]
+//     println("${kafkaerror.is_authorization_failure(KafkaErrTopicAuthorizationFailed)}")
+// ```
+pub fn is_authorization_failure(c: KafkaErrorCode) -> Bool
+    todo("kafka-codec-nv.kafkaerror.is_authorization_failure")
+
+// One line naming what went wrong, for a report a person reads.
+//
+// ```novo
+// use kafkaerror
+//
+// fn main() [io]
+//     println(kafkaerror.fault_message(KafkaBadMagic(1)))
+// ```
+pub fn fault_message(f: KafkaFault) -> Str
+    todo("kafka-codec-nv.kafkaerror.fault_message")
+
+// A short stable word for a metric label: `"truncated"`,
+// `"bad_crc"`, `"unknown_api_key"`.
+//
+// Free of anything the wire supplied, so it cannot put an
+// attacker-chosen string into a time series.
+//
+// ```novo
+// use kafkaerror
+//
+// fn main() [io]
+//     println(kafkaerror.fault_code(KafkaBadCrc(1, 2)))                 // bad_crc
+// ```
+pub fn fault_code(f: KafkaFault) -> Str
+    todo("kafka-codec-nv.kafkaerror.fault_code")
+
+// Whether the fault means the connection must be closed rather than
+// the request retried.
+//
+// True for `KafkaCorrelationMismatch`, `KafkaTrailingBytes` and
+// `KafkaBadVarint`: each means the decoder no longer knows where the
+// next frame begins, and there is no way to resynchronise a stream
+// whose framing is a length prefix.  False for
+// `KafkaTruncated`, which on a stream just means "read more".
+//
+// ```novo
+// use kafkaerror
+//
+// fn main() [io]
+//     println("${kafkaerror.is_fatal_to_connection(KafkaCorrelationMismatch(7))}")
+// ```
+pub fn is_fatal_to_connection(f: KafkaFault) -> Bool
+    todo("kafka-codec-nv.kafkaerror.is_fatal_to_connection")

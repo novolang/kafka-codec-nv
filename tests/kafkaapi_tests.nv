@@ -1,0 +1,118 @@
+// kafkaapi_tests.nv — the API suite for the version table and the one
+// refusal the package makes on purpose.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// kafka-codec-nv.kafkaapi.<fn>`.  What is asserted is that an unknown
+// API key is refused while an unknown error code is not, that every
+// key's flexible floor is its own, and that the `ApiVersions` response
+// header is the exception the whole package has to know about.
+
+use std.test
+use kafkaapi
+use kafkaerror
+
+@test
+fn test_an_unknown_api_key_is_a_refusal_and_an_unknown_error_code_is_not() [io]
+    // A client chooses which request it sends and can only send one it
+    // can encode.  It does not choose which error it is told about.
+    test.case("the eleven keys this release encodes round-trip through their numbers")
+    test.assert(kafkaapi.api_key_number(KafkaProduce) == 0)
+    test.assert(kafkaapi.api_key_number(KafkaApiVersions) == 18)
+    test.assert(kafkaapi.api_key_name(KafkaFindCoordinator) == "FindCoordinator")
+    match kafkaapi.api_key_of_number(3)
+        Ok(k)  => test.assert(kafkaapi.api_key_name(k) == "Metadata")
+        Err(_) => test.fail("Metadata is key 3 and is encoded by this release")
+
+    test.case("a key this release does not encode is refused, naming the number")
+    // CreateTopics is 19.  Refused rather than skipped, because a
+    // response body has no length of its own: the frame's size prefix
+    // covers header and body together, so skipping it and losing the
+    // stream are the same action.
+    match kafkaapi.api_key_of_number(19)
+        Ok(_)  => test.fail("CreateTopics is in the README's `What is not included`")
+        Err(_) => test.assert(true)
+
+    test.case("and the opposite rule holds for an error code")
+    match kafkaerror.error_code_of_number(31337)
+        KafkaErrOther(n) => test.assert(n == 31337)
+        _                => test.fail("an unnamed code carries its number rather than refusing")
+
+    test.case("the list of what is left out is a function, not only a paragraph")
+    // A program that generates a capability report reads the same list
+    // the README does, so the two cannot drift.
+    test.assert(list.len(kafkaapi.unencoded_api_keys()) > 0)
+    test.assert(list.len(kafkaapi.all_api_keys()) == 11)
+
+@test
+fn test_every_key_became_flexible_in_its_own_release() [io]
+    // There is no cluster-wide flag and no way to derive this: it is a
+    // table, and getting one entry wrong desynchronises every field of
+    // that message.
+    test.case("the floors differ per key")
+    test.assert(kafkaapi.flexible_from(KafkaMetadata) == 9)
+    test.assert(kafkaapi.flexible_from(KafkaFetch) == 12)
+    test.assert(kafkaapi.flexible_from(KafkaApiVersions) == 3)
+
+    test.case("`is_flexible` is the floor applied to a version")
+    test.assert(kafkaapi.is_flexible(KafkaMetadata, 9))
+    test.assert(not kafkaapi.is_flexible(KafkaMetadata, 8))
+
+    test.case("and `wire_style` is the only place the question is asked")
+    match kafkaapi.wire_style(KafkaFetch, 12)
+        KafkaFlexible => test.assert(true)
+        KafkaClassic  => test.fail("Fetch v12 is flexible")
+    match kafkaapi.wire_style(KafkaFetch, 11)
+        KafkaClassic  => test.assert(true)
+        KafkaFlexible => test.fail("Fetch v11 is not")
+
+@test
+fn test_the_api_versions_response_header_is_the_protocols_one_exception() [io]
+    // A client sends `ApiVersions` before it knows whether the broker
+    // speaks flexible versions, so its response header cannot depend
+    // on the answer.  A decoder that applied the general rule reads a
+    // tagged-field count that is not there.
+    test.case("a flexible request carries a header v2")
+    test.assert(kafkaapi.header_request_version(KafkaMetadata, 9) == 2)
+    test.assert(kafkaapi.header_request_version(KafkaMetadata, 8) == 1)
+
+    test.case("and a flexible response a header v1 — except this one")
+    test.assert(kafkaapi.header_response_version(KafkaMetadata, 9) == 1)
+    test.assert(kafkaapi.header_response_version(KafkaApiVersions, 3) == 0)
+    test.assert(kafkaapi.header_response_version(KafkaApiVersions, 0) == 0)
+
+@test
+fn test_a_version_is_negotiated_rather_than_assumed() [io]
+    // A client that sent its newest version to a broker one release
+    // older gets `UNSUPPORTED_VERSION` back, which is the same outcome
+    // one round trip later and with the connection already used.
+    let broker = [KafkaApiSupport { key: 0, min_version: 0, max_version: 7 },
+                  KafkaApiSupport { key: 1, min_version: 0, max_version: 11 }]
+
+    test.case("the highest version both sides speak wins")
+    match kafkaapi.negotiate(KafkaProduce, broker)
+        Ok(v)  => test.assert(v == 7)
+        Err(_) => test.fail("this package and a v7 broker have Produce in common")
+
+    test.case("a key the broker does not list is refused, naming this package's range")
+    match kafkaapi.negotiate(KafkaHeartbeat, broker)
+        Ok(_)  => test.fail("the broker listed no Heartbeat")
+        Err(_) => test.assert(true)
+
+    test.case("negotiating everything at once omits what has no version in common")
+    // So a client can still produce to a broker too old for the
+    // consumer group APIs, rather than being refused a connection.
+    test.assert(list.len(kafkaapi.negotiate_all(broker)) == 2)
+
+    test.case("this package's own range is narrower than the protocol's")
+    let r = kafkaapi.supported_versions(KafkaProduce)
+    test.assert(r.min <= r.max)
+    test.assert(kafkaapi.supports(KafkaProduce, r.max))
+    test.assert(not kafkaapi.supports(KafkaProduce, r.max + 1))
+
+    test.case("and one refusal sentence is written once, for every encoder to use")
+    match kafkaapi.check_version(KafkaProduce, r.max + 1)
+        Some(_) => test.assert(true)
+        None    => test.fail("a version past the top of the range is refused")
+    match kafkaapi.check_version(KafkaProduce, r.min)
+        Some(_) => test.fail("the bottom of the range is supported")
+        None    => test.assert(true)

@@ -1,0 +1,252 @@
+// kafkacover_tests.nv — the rest of the public surface, one written
+// expectation each.
+//
+// RED ON PURPOSE, like every suite here.  The four suites beside this
+// one assert the DESIGN — the two spellings, the version table, the
+// record batch, the state machine.  This one exists so that no public
+// function ships without a written statement of what it answers, and
+// it covers `kafkaerror`, `kafkahdr`, `kafkareq` and `kafkaresp`.
+
+use std.test
+use kafkaapi
+use kafkaerror
+use kafkahdr
+use kafkaprim
+use kafkarecords
+use kafkareq
+use kafkaresp
+
+@test
+fn test_an_error_code_carries_what_a_client_should_do_about_it() [io]
+    // "Retriable" alone is not enough.  A client with only that would
+    // retry a `NOT_LEADER_OR_FOLLOWER` against the broker that just
+    // said it is not the leader, forever.
+    test.case("the codes round-trip through their numbers")
+    test.assert(kafkaerror.error_code_number(KafkaErrNotCoordinator) == 16)
+    test.assert(kafkaerror.error_code_name(KafkaErrRebalanceInProgress)
+                == "REBALANCE_IN_PROGRESS")
+    match kafkaerror.error_code_of_number(0)
+        KafkaErrNone => test.assert(true)
+        _            => test.fail("zero is success")
+
+    test.case("a transient cluster state is worth repeating")
+    test.assert(kafkaerror.is_retriable(KafkaErrLeaderNotAvailable))
+    test.assert(not kafkaerror.is_retriable(KafkaErrMessageTooLarge))
+    test.assert(not kafkaerror.is_retriable(KafkaErrOther(31337)))
+
+    test.case("a stale partition map and a stale coordinator are different caches")
+    test.assert(kafkaerror.needs_metadata_refresh(KafkaErrNotLeaderOrFollower))
+    test.assert(not kafkaerror.needs_metadata_refresh(KafkaErrNotCoordinator))
+    test.assert(kafkaerror.needs_coordinator_refresh(KafkaErrNotCoordinator))
+    test.assert(not kafkaerror.needs_coordinator_refresh(KafkaErrNotLeaderOrFollower))
+
+    test.case("and a missing permission is never retried, because it stays missing")
+    test.assert(kafkaerror.is_authorization_failure(KafkaErrTopicAuthorizationFailed))
+    test.assert(not kafkaerror.is_authorization_failure(KafkaErrRequestTimedOut))
+
+@test
+fn test_a_codec_fault_says_whether_the_connection_survives_it() [io]
+    // A decoder that has lost its place in a length-prefixed stream
+    // cannot find it again: there is no magic number to scan for.
+    test.case("a message is for a person and a code is for a metric")
+    test.assert(str.len(kafkaerror.fault_message(KafkaBadMagic(1))) > 0)
+    test.assert(kafkaerror.fault_code(KafkaBadCrc(1, 2))
+                == kafkaerror.fault_code(KafkaBadCrc(3, 4)))
+
+    test.case("a code carries nothing the wire supplied, so it is safe as a label")
+    test.assert(not str.contains(kafkaerror.fault_code(KafkaUnknownApiKey(31337)), "31337"))
+
+    test.case("a lost correlation is fatal; a short read is not")
+    test.assert(kafkaerror.is_fatal_to_connection(KafkaCorrelationMismatch(7)))
+    test.assert(not kafkaerror.is_fatal_to_connection(KafkaTruncated(0, 4, "length")))
+
+@test
+fn test_a_response_headers_shape_comes_from_the_request_not_the_bytes() [io]
+    // A response header is a correlation id and possibly a
+    // tagged-field section, and nothing in it says which.
+    test.case("a request header names its key, version, correlation id and client")
+    let h = kafkahdr.request_header(KafkaMetadata, 9, 7, "orders-indexer")
+    test.assert(h.correlation_id == 7)
+    test.assert(h.client_id == "orders-indexer")
+    test.assert(not h.client_id_is_null)
+    test.assert(kafkahdr.request_header_version(h) == 2)
+
+    test.case("a null client id is spelled separately from an empty one")
+    test.assert(kafkahdr.with_null_client_id(h).client_id_is_null)
+
+    test.case("tagged fields are refused on a header version that has no section")
+    let classic = kafkahdr.request_header(KafkaMetadata, 8, 7, "orders-indexer")
+    match kafkahdr.with_tagged(classic, [KafkaTaggedField { tag: 0, data: bytes.zeros(1) }])
+        Ok(_)  => test.fail("a header v1 has nowhere to put them")
+        Err(_) => test.assert(true)
+
+    test.case("encoding a header needs a writer already in the message's style")
+    match kafkahdr.encode_request_header(
+              kafkaprim.writer(kafkaapi.wire_style(KafkaMetadata, 9)), h)
+        Ok(w)  => test.assert(kafkaprim.written(w) > 0)
+        Err(_) => test.fail("a v9 header encodes into a flexible writer")
+
+    test.case("and decoding one needs the key and version the bytes do not carry")
+    let c = kafkaprim.cursor(bytes.zeros(4), kafkaapi.wire_style(KafkaMetadata, 9))
+    match kafkahdr.decode_response_header(c, KafkaMetadata, 9)
+        Ok(r)  => test.assert(r.cursor.offset >= 4)
+        Err(_) => test.assert(true)
+
+    test.case("the other direction exists so a test double can answer real clients")
+    match kafkahdr.decode_request_header(kafkaprim.cursor(bytes.zeros(2), KafkaClassic))
+        Ok(_)  => test.fail("two bytes are not a whole request header")
+        Err(_) => test.assert(true)
+    match kafkahdr.encode_response_header(kafkaprim.writer(KafkaClassic),
+                                          kafkahdr.response_header(7), KafkaMetadata, 8)
+        Ok(w)  => test.assert(kafkaprim.written(w) == 4)
+        Err(_) => test.fail("a v0 response header is four bytes")
+
+    test.case("and a mismatch is the only evidence a client gets that the stream diverged")
+    match kafkahdr.check_correlation(kafkahdr.response_header(7), 7)
+        Some(_) => test.fail("seven answers seven")
+        None    => test.assert(true)
+    match kafkahdr.check_correlation(kafkahdr.response_header(8), 7)
+        Some(_) => test.assert(true)
+        None    => test.fail("eight does not answer seven")
+
+@test
+fn test_a_null_topic_list_and_an_empty_one_differ_by_the_whole_cluster() [io]
+    test.case("`Metadata` for named topics asks about those")
+    test.assert(list.len(kafkareq.metadata_request(["orders"]).topics) == 1)
+    test.assert(not kafkareq.metadata_request(["orders"]).topics_is_null)
+
+    test.case("and `metadata_for_all_topics` is the null form, spelled separately")
+    test.assert(kafkareq.metadata_for_all_topics().topics_is_null)
+
+    test.case("`OffsetFetch` has the same pair for the same reason")
+    test.assert(not kafkareq.offset_fetch_request("indexers", []).topics_is_null)
+    test.assert(kafkareq.offset_fetch_all("indexers").topics_is_null)
+
+    test.case("an `ApiVersions` request names the client's software, for a broker's report")
+    test.assert(kafkareq.api_versions_request("novo-kafka-nv", "0.0.1").client_software_name
+                == "novo-kafka-nv")
+
+@test
+fn test_the_two_offset_sentinels_are_one_transposition_apart() [io]
+    // `-1` and `-2` are the two ends of the log, so they are named
+    // functions rather than constants a caller copies.
+    test.case("the earliest retained offset is -2 and one past the last record is -1")
+    test.assert(kafkareq.earliest_offset() == -2)
+    test.assert(kafkareq.latest_offset() == -1)
+
+    test.case("a list-offsets request carries them per partition")
+    let t = KafkaListOffsetsTopic { name: "orders",
+                                    partitions: [KafkaListOffsetsPartition {
+                                        index: 0,
+                                        current_leader_epoch: -1,
+                                        timestamp: -2 }] }
+    test.assert(list.len(kafkareq.list_offsets_request([t]).topics) == 1)
+
+    test.case("a fetch's long poll is what makes an idle consumer cheap")
+    // A fetch with a 500 ms window and `min_bytes` of 1 costs two round
+    // trips a second instead of thousands.
+    test.assert(kafkareq.fetch_request(500, 1, 52428800, []).max_wait_ms == 500)
+
+    test.case("and a produce's acks decide whether there is a reply at all")
+    test.assert(kafkareq.produce_request(-1, 30000, []).acks == -1)
+
+@test
+fn test_group_membership_is_a_handshake_and_its_refusals_are_routine() [io]
+    test.case("the coordinator for a group and for a transaction are different lookups")
+    test.assert(kafkareq.find_coordinator_request("indexers").key_type == 0)
+    test.assert(kafkareq.find_transaction_coordinator_request("tx-1").key_type == 1)
+
+    test.case("a first join has no member id, and the coordinator hands one out")
+    let j = kafkareq.join_group_request("indexers", 45000, 300000, [])
+    test.assert(j.member_id == "")
+    test.assert(kafkareq.with_member_id(j, "m-1").member_id == "m-1")
+
+    test.case("a static member keeps its partitions across a restart")
+    // Which is the whole point of KIP-345 and is lost silently if the
+    // field is dropped at an older version.
+    test.assert(kafkareq.with_group_instance_id(j, "pod-3").group_instance_id == "pod-3")
+
+    test.case("only the leader sends assignments, and the two calls say which member this is")
+    test.assert(list.len(kafkareq.sync_group_request("indexers", 4, "m-1").assignments) == 0)
+    test.assert(list.len(kafkareq.sync_group_as_leader("indexers", 4, "m-1",
+                    [KafkaSyncGroupAssignment { member_id: "m-2",
+                                                assignment: bytes.zeros(4) }]).assignments) == 1)
+
+    test.case("a heartbeat and a commit both carry the generation they belong to")
+    // A commit carrying a stale generation is `ILLEGAL_GENERATION`,
+    // which stops an evicted member overwriting the position of
+    // whoever took its partitions.
+    test.assert(kafkareq.heartbeat_request("indexers", 4, "m-1").generation_id == 4)
+    test.assert(kafkareq.offset_commit_request("indexers", 4, "m-1", []).generation_id == 4)
+
+@test
+fn test_one_encoder_pairs_a_body_with_its_header_exactly_once() [io]
+    // Eleven encoders would be eleven chances to pair a body with a
+    // header at the wrong version.
+    let r = KafkaApiVersionsReq(kafkareq.api_versions_request("novo-kafka-nv", "0.0.1"))
+
+    test.case("a request knows which key it is")
+    test.assert(kafkaapi.api_key_name(kafkareq.request_api_key(r)) == "ApiVersions")
+
+    test.case("and one function turns it into bytes, header included")
+    let h = kafkahdr.request_header(KafkaApiVersions, 3, 1, "novo-kafka-nv")
+    match kafkareq.encode_request(h, r, kafkarecords.no_codecs())
+        Ok(raw) => test.assert(bytes.len(raw) > 0)
+        Err(_)  => test.fail("an ApiVersions v3 request encodes")
+
+    test.case("a field whose absence would change the meaning is refused, not dropped")
+    // A transactional id on a `Produce` below v3 would silently produce
+    // outside the transaction.
+    let p = KafkaProduceReq(kafkareq.produce_request(-1, 30000, []))
+    match kafkareq.check_encodable(p, 3)
+        Some(_) => test.fail("a plain produce at v3 carries nothing v3 cannot hold")
+        None    => test.assert(true)
+
+@test
+fn test_an_error_code_is_per_partition_and_the_convenience_says_so_in_its_name() [io]
+    // A produce or fetch to twelve partitions carries twelve
+    // independent codes.  A client that looked at one would fail a
+    // whole batch over one partition, or succeed it over eleven.
+    let r = KafkaHeartbeatResp(kafkaresp.empty_heartbeat_response())
+
+    test.case("a response knows which key it answers")
+    test.assert(kafkaapi.api_key_name(kafkaresp.response_api_key(r)) == "Heartbeat")
+
+    test.case("`first_error` is for a caller that asked about one partition")
+    match kafkaresp.first_error(r)
+        Some(_) => test.fail("an empty heartbeat reply carries no error")
+        None    => test.assert(true)
+
+    test.case("and `errors_of` is the general answer, with where each came from")
+    test.assert(list.len(kafkaresp.errors_of(r)) == 0)
+    test.assert(kafkaresp.is_all_ok(r))
+
+    test.case("throttle time is advice the broker has already acted on")
+    // A client that adds its own delay of the same length throttles
+    // itself twice; one that ignores the field keeps being throttled.
+    test.assert(kafkaresp.throttle_time_of(r) == 0)
+
+    test.case("a lag figure needs the high watermark of one partition")
+    match kafkaresp.high_watermark_of(r, "orders", 0)
+        Some(_) => test.fail("a heartbeat reply has no partitions")
+        None    => test.assert(true)
+
+    test.case("and a consumer on one partition wants its batches without the two loops")
+    test.assert(list.len(kafkaresp.all_batches(r)) == 0)
+
+@test
+fn test_a_response_decodes_at_the_version_its_request_was_sent_at() [io]
+    let set = kafkarecords.no_codecs()
+
+    test.case("an empty buffer is `not a whole response`, not corruption")
+    match kafkaresp.decode_response(bytes.zeros(0), KafkaApiVersions, 3, set)
+        Ok(_)  => test.fail("no bytes are no response")
+        Err(_) => test.assert(true)
+
+    test.case("and the other direction exists so a test double can answer")
+    // A client's error handling is the half that is never exercised
+    // against a healthy broker.
+    let r = KafkaHeartbeatResp(kafkaresp.empty_heartbeat_response())
+    match kafkaresp.encode_response(r, 4, 7, set)
+        Ok(raw) => test.assert(bytes.len(raw) > 0)
+        Err(_)  => test.fail("a heartbeat reply at v4 encodes")

@@ -1,0 +1,213 @@
+// kafkarecords_tests.nv — the API suite for the v2 record batch, the
+// checksum and the codecs that are handed in rather than linked.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// kafka-codec-nv.kafkarecords.<fn>`.  What is asserted is that a
+// missing codec is named rather than swallowed, that a null value and
+// an empty one are a deletion and a message, and that a record's
+// offset is the batch's base plus its delta.
+
+use std.test
+use kafkaprim
+use kafkarecords
+
+// A batch at a real offset and a fixed instant.  The instant is a
+// PARAMETER everywhere in this package — a `core` module may not read
+// a clock — and the by-product is that this suite gets the same bytes
+// every time it runs.
+fn a_batch() -> kafkarecords.KafkaRecordBatch
+    kafkarecords.batch(41000, 1789000000000)
+
+fn a_record() -> kafkarecords.KafkaRecord
+    kafkarecords.record(bytes.from_str("order-7"), bytes.from_str("{}"))
+
+@test
+fn test_a_missing_codec_is_named_rather_than_swallowed() [io]
+    // This package depends on no compression library.  A consumer that
+    // silently returned no records from a snappy partition would look
+    // like a consumer that had caught up, which is the one failure
+    // nobody investigates.
+    test.case("an empty set still handles every uncompressed topic")
+    let set = kafkarecords.no_codecs()
+    test.assert(not kafkarecords.needs_codec(KafkaNoCompression))
+    test.assert(kafkarecords.needs_codec(KafkaSnappy))
+
+    test.case("and holds no function for the four that need one")
+    match kafkarecords.codec_for(set, KafkaZstd)
+        Some(_) => test.fail("no_codecs() holds nothing")
+        None    => test.assert(true)
+
+    test.case("what the set can do is answerable, so a producer can choose")
+    test.assert(list.len(kafkarecords.available_compressions(set)) == 1)
+
+    test.case("`KafkaNoCompression` has no slot, so supplying one is refused")
+    let dummy = KafkaCodec { compress: passthrough, decompress: passthrough }
+    match kafkarecords.with_codec(set, KafkaNoCompression, dummy)
+        Ok(_)  => test.fail("there is no slot for the codec that is not one")
+        Err(_) => test.assert(true)
+
+    test.case("and supplying a real one fills that slot")
+    match kafkarecords.with_codec(set, KafkaGzip, dummy)
+        Ok(s2) =>
+            match kafkarecords.codec_for(s2, KafkaGzip)
+                Some(_) => test.assert(true)
+                None    => test.fail("the gzip slot was just filled")
+        Err(_) => test.fail("gzip has a slot")
+
+// A codec that does nothing, for the shape of the call rather than for
+// its behaviour.
+fn passthrough(b: Bytes) -> Result<Bytes, Str>
+    Ok(b)
+
+@test
+fn test_the_compression_bits_are_a_closed_set_and_an_unknown_one_is_refused() [io]
+    // A batch whose codec bits are `5` is one this package cannot read.
+    // Treating it as uncompressed would hand a caller compressed bytes
+    // as if they were a message.
+    test.case("the five codecs have the numbers the attributes carry")
+    test.assert(kafkarecords.compression_id(KafkaNoCompression) == 0)
+    test.assert(kafkarecords.compression_id(KafkaGzip) == 1)
+    test.assert(kafkarecords.compression_id(KafkaLz4) == 3)
+    test.assert(kafkarecords.compression_id(KafkaZstd) == 4)
+
+    test.case("a sixth is refused rather than defaulted")
+    match kafkarecords.compression_of_id(5)
+        Ok(_)  => test.fail("there are five codecs")
+        Err(_) => test.assert(true)
+    match kafkarecords.compression_of_id(2)
+        Ok(c)  => test.assert(kafkarecords.compression_name(c) == "snappy")
+        Err(_) => test.fail("2 is snappy")
+
+    test.case("the names are the ones in a broker's own configuration file")
+    match kafkarecords.compression_named("zstd")
+        Some(_) => test.assert(true)
+        None    => test.fail("`zstd` is what `compression.type` is set to")
+    match kafkarecords.compression_named("brotli")
+        Some(_) => test.fail("Kafka has no brotli")
+        None    => test.assert(true)
+
+@test
+fn test_the_attribute_bits_carry_what_a_consumer_must_branch_on() [io]
+    test.case("plain attributes are all zero")
+    test.assert(kafkarecords.attributes_bits(kafkarecords.plain_attributes()) == 0)
+
+    test.case("declaring a codec sets the low three bits")
+    let gz = kafkarecords.with_compression(kafkarecords.plain_attributes(), KafkaGzip)
+    test.assert(kafkarecords.attributes_bits(gz) == 1)
+
+    test.case("and reading them back is total except for an unknown codec")
+    match kafkarecords.attributes_of_bits(0)
+        Ok(a)  => test.assert(not a.is_control and not a.is_transactional)
+        Err(_) => test.fail("zero is a plain batch")
+
+    test.case("a control batch carries a transaction marker and no application data")
+    // A consumer that handed its contents to an application would
+    // deliver a four-byte binary blob as if it were a message.
+    test.assert(not kafkarecords.is_control_batch(a_batch()))
+    match kafkarecords.control_of(a_batch())
+        Ok(_)  => test.fail("a plain batch is not a marker")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_null_value_deletes_a_key_and_an_empty_one_does_not() [io]
+    // On a compacted topic the difference is whether the key survives.
+    test.case("a record has both a key and a value present")
+    let r = a_record()
+    test.assert(not r.key_is_null)
+    test.assert(not r.value_is_null)
+
+    test.case("a record with no key is partitioned at random, not by a hash")
+    test.assert(kafkarecords.record_without_key(bytes.from_str("{}")).key_is_null)
+
+    test.case("and a tombstone is a key with a NULL value")
+    let t = kafkarecords.tombstone(bytes.from_str("order-7"))
+    test.assert(t.value_is_null)
+    test.assert(not t.key_is_null)
+
+    test.case("headers are the application's own pairs, and are separate from the batch header")
+    let h = kafkarecords.with_headers(r, [KafkaRecordHeader { key: "trace", value: bytes.zeros(8) }])
+    test.assert(list.len(h.headers) == 1)
+
+    test.case("an instant arrives as a parameter, in milliseconds")
+    test.assert(kafkarecords.record_at(r, 1789000000000).timestamp_delta >= 0)
+
+@test
+fn test_a_records_offset_is_the_batchs_base_plus_its_delta() [io]
+    // A caller that reported the delta would report `0` for the first
+    // record of every batch in the topic.
+    let b = kafkarecords.append(a_batch(), a_record())
+
+    test.case("appending computes the deltas, so the header agrees with the contents")
+    test.assert(b.last_offset_delta == 0)
+    test.assert(kafkarecords.absolute_offset(b, a_record()) == 41000)
+
+    test.case("a timestamp is the base plus the delta, except under log-append time")
+    test.assert(kafkarecords.absolute_timestamp(b, a_record()) == 1789000000000)
+
+    test.case("what a consumer commits is the NEXT offset, not the last one read")
+    // A consumer that commits the last offset reprocesses one record
+    // per partition after every restart.
+    test.assert(kafkarecords.next_offset(b) == 41001)
+
+    test.case("attributes and a producer identity attach to the batch, not the record")
+    test.assert(kafkarecords.attributes_bits(
+        kafkarecords.with_attributes(b, kafkarecords.plain_attributes()).attributes) == 0)
+    test.assert(kafkarecords.with_producer(b, 91, 3, 0).producer_id == 91)
+
+@test
+fn test_the_checksum_covers_the_compressed_bytes_and_is_written_last() [io]
+    // Build the records, compress them, fill in the header, then
+    // checksum what is now there.  An implementation that checksummed
+    // first produces a batch every broker refuses.
+    let b = kafkarecords.append(a_batch(), a_record())
+    let set = kafkarecords.no_codecs()
+
+    test.case("the magic is 2, because the pre-0.11 message sets are not read here")
+    test.assert(b.magic == 2)
+
+    test.case("a batch encodes to bytes and its size is answerable first")
+    // A producer has to know whether one more record still fits under
+    // the broker's ceiling, and the answer is not the sum of the record
+    // sizes: the deltas are varints whose width depends on the batch.
+    match kafkarecords.batch_size(b, set)
+        Ok(n)  => test.assert(n > 0)
+        Err(_) => test.fail("an uncompressed batch needs no codec")
+    match kafkarecords.encode_batch(b, set)
+        Ok(raw) =>
+            test.case("and the checksum it carries is the one its bytes imply")
+            match kafkarecords.batch_crc(raw)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.fail("a whole batch has a computable CRC")
+            match kafkarecords.verify_crc(raw)
+                Ok(ok) => test.assert(ok)
+                Err(_) => test.fail("a batch this package encoded verifies")
+        Err(_)  => test.fail("an uncompressed batch needs no codec")
+
+    test.case("one record's size includes its varint length prefix")
+    test.assert(kafkarecords.record_size(b, a_record()) > 0)
+
+@test
+fn test_a_truncated_trailing_batch_is_dropped_rather_than_refused() [io]
+    // A broker truncates a fetch's record set at the byte limit rather
+    // than at a batch boundary.  A consumer that treated the remainder
+    // as corruption would stall on every partition whose next batch is
+    // larger than `max_bytes`.
+    let set = kafkarecords.no_codecs()
+
+    test.case("an empty record set holds no batches and is not an error")
+    match kafkarecords.decode_batches(bytes.zeros(0), set)
+        Ok(bs) => test.assert(list.len(bs) == 0)
+        Err(_) => test.fail("no bytes is no batches")
+
+    test.case("and a partial one at an offset is `not a whole batch yet`")
+    match kafkarecords.decode_batch(bytes.zeros(3), 0, set)
+        Ok(_)  => test.fail("three bytes are not a batch header")
+        Err(_) => test.assert(true)
+
+    test.case("a caller assembling a batch itself can encode one record at a time")
+    // A producer whose batch size is its memory ceiling cannot build
+    // the whole batch in memory first.
+    match kafkarecords.encode_record(a_batch(), a_record(),
+                                     kafkaprim.writer(KafkaClassic))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("a plain record encodes")
