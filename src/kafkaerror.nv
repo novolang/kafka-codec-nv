@@ -284,6 +284,22 @@ pub enum KafkaFault
     // could not skip an unknown tag safely.
     KafkaBadTaggedFields(offset: Int, detail: Str)
 
+// `KafkaFault` is an `Error`, which is what lets
+// `Result<T, KafkaFault>` exist at all — every fallible read and write
+// in `kafkaprim`, `kafkahdr`, `kafkaframe`, `kafkarecords`,
+// `kafkareq`, `kafkaresp` and `kafkaapi` answers with one.
+//
+// `KafkaErrorCode` gets no impl and needs none: a broker error code is
+// a field inside a response that decoded, so it is carried as a value
+// and never occupies a `Result`'s error position.
+impl Error for KafkaFault
+    // The one-line message: `kafkaerror.fault_message`'s sentence,
+    // naming what the bytes did and the offset it happened at.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("kafka-codec-nv.KafkaFault.message")
+
 // The number a broker puts on the wire for this code.
 //
 // `KafkaErrOther` answers the number it carries, so the round trip
