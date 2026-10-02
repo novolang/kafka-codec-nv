@@ -57,7 +57,7 @@ fn test_a_missing_codec_is_named_rather_than_swallowed() [io]
 // A codec that does nothing, for the shape of the call rather than for
 // its behaviour.
 fn passthrough(b: Bytes) -> Result<Bytes, Str>
-    Ok(b)
+    Ok(bytes.clone(b))
 
 @test
 fn test_the_compression_bits_are_a_closed_set_and_an_unknown_one_is_refused() [io]
