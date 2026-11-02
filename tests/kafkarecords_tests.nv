@@ -1,11 +1,10 @@
 // kafkarecords_tests.nv — the API suite for the v2 record batch, the
 // checksum and the codecs that are handed in rather than linked.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// kafka-codec-nv.kafkarecords.<fn>`.  What is asserted is that a
-// missing codec is named rather than swallowed, that a null value and
-// an empty one are a deletion and a message, and that a record's
-// offset is the batch's base plus its delta.
+// What is asserted is that a missing codec is named rather than
+// swallowed, that a null value and an empty one are a deletion and a
+// message, and that a record's offset is the batch's base plus its
+// delta.
 
 use std.test
 use kafkaprim

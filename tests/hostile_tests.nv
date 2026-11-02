@@ -1,0 +1,27 @@
+// hostile_tests.nv — counts no honest peer writes.
+
+use std.bytes
+use std.test
+use std.list
+use kafkaprim
+
+// The bytes of a varint, given group by group.
+fn uvarint_bytes(groups: [Int]) -> Bytes
+    var c = bytes.cursor_le(bytes.zeros(list.len(groups)))
+    for g in groups
+        c.put_u8(g)
+    c.finish()
+
+@test
+fn test_a_flexible_count_with_the_sign_bit_set_is_refused() [io]
+    let wire = uvarint_bytes([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01])
+    match kafkaprim.read_array_len(kafkaprim.cursor(wire, kafkaprim.KafkaFlexible))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_flexible_count_still_reads() [io]
+    let wire = uvarint_bytes([0x04])
+    match kafkaprim.read_array_len(kafkaprim.cursor(wire, kafkaprim.KafkaFlexible))
+        Ok(r)  => test.assert_eq(r.count, 3)
+        Err(_) => test.assert(false)

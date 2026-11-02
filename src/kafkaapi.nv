@@ -1,8 +1,6 @@
 // kafkaapi.nv — the table: which requests this release encodes, at
 // which versions, in which spelling, behind which header.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // AN UNKNOWN API KEY IS A TYPED REFUSAL, NOT A SKIP.  `KafkaApiKey`
 // has an arm for each of the eleven requests this release encodes and
 // no arm for anything else, so there is no value that means "some
@@ -46,6 +44,37 @@
 
 use kafkaerror
 use kafkaprim
+
+// The higher of two versions.
+fn higher(a: Int, b: Int) -> Int
+    if a > b
+        a
+    else
+        b
+
+// The lower of two versions.
+fn lower(a: Int, b: Int) -> Int
+    if a < b
+        a
+    else
+        b
+
+// Whether the broker's list names this key at all.
+//
+// The distinction matters in the refusal: a key the broker did not
+// list is not the same answer as a key whose range does not meet this
+// package's, and the two read differently in a log line.
+fn listed_at(broker: [KafkaApiSupport], key: Int) -> Bool
+    for s in broker
+        if s.key == key
+            return true
+    false
+
+// The chosen version, or `None` where `negotiate` would refuse.
+fn negotiated_version(k: KafkaApiKey, broker: [KafkaApiSupport]) -> ?Int
+    match negotiate(k, broker)
+        Ok(v)  => Some(v)
+        Err(_) => None
 
 // A request this package can encode.
 //
@@ -114,7 +143,18 @@ pub struct KafkaApiSupport
 //     println("${kafkaapi.api_key_number(KafkaApiVersions)}")    // 18
 // ```
 pub fn api_key_number(k: KafkaApiKey) -> Int
-    todo("kafka-codec-nv.kafkaapi.api_key_number")
+    match k
+        KafkaProduce         => 0
+        KafkaFetch           => 1
+        KafkaListOffsets     => 2
+        KafkaMetadata        => 3
+        KafkaOffsetCommit    => 8
+        KafkaOffsetFetch     => 9
+        KafkaFindCoordinator => 10
+        KafkaJoinGroup       => 11
+        KafkaHeartbeat       => 12
+        KafkaSyncGroup       => 14
+        KafkaApiVersions     => 18
 
 // The key a number denotes, or `kafkaerror.KafkaUnknownApiKey`.
 //
@@ -130,12 +170,35 @@ pub fn api_key_number(k: KafkaApiKey) -> Int
 //         Err(_) => println("CreateTopics is not encoded by this release")
 // ```
 pub fn api_key_of_number(n: Int) -> Result<KafkaApiKey, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaapi.api_key_of_number")
+    match n
+        0  => Ok(KafkaProduce)
+        1  => Ok(KafkaFetch)
+        2  => Ok(KafkaListOffsets)
+        3  => Ok(KafkaMetadata)
+        8  => Ok(KafkaOffsetCommit)
+        9  => Ok(KafkaOffsetFetch)
+        10 => Ok(KafkaFindCoordinator)
+        11 => Ok(KafkaJoinGroup)
+        12 => Ok(KafkaHeartbeat)
+        14 => Ok(KafkaSyncGroup)
+        18 => Ok(KafkaApiVersions)
+        _  => Err(kafkaerror.KafkaUnknownApiKey(n))
 
 // The name the Kafka protocol guide gives the key: `"Produce"`,
 // `"FindCoordinator"`, `"ApiVersions"`.
 pub fn api_key_name(k: KafkaApiKey) -> Str
-    todo("kafka-codec-nv.kafkaapi.api_key_name")
+    match k
+        KafkaProduce         => "Produce"
+        KafkaFetch           => "Fetch"
+        KafkaListOffsets     => "ListOffsets"
+        KafkaMetadata        => "Metadata"
+        KafkaOffsetCommit    => "OffsetCommit"
+        KafkaOffsetFetch     => "OffsetFetch"
+        KafkaFindCoordinator => "FindCoordinator"
+        KafkaJoinGroup       => "JoinGroup"
+        KafkaHeartbeat       => "Heartbeat"
+        KafkaSyncGroup       => "SyncGroup"
+        KafkaApiVersions     => "ApiVersions"
 
 // The versions of this API that THIS PACKAGE encodes and decodes.
 //
@@ -152,7 +215,23 @@ pub fn api_key_name(k: KafkaApiKey) -> Str
 //     println("Produce v${r.min}..v${r.max}")
 // ```
 pub fn supported_versions(k: KafkaApiKey) -> KafkaVersionRange
-    todo("kafka-codec-nv.kafkaapi.supported_versions")
+    // Each range includes that key's flexible floor and stops at the
+    // last version whose body this package can encode and decode.
+    // `Produce` starts at v3 and `Fetch` at v4 because record batch v2
+    // needs the `Produce` v3 request shape and the `Fetch` v4 one; see
+    // the README's "What is not included".
+    match k
+        KafkaProduce         => KafkaVersionRange { min: 3, max: 9 }
+        KafkaFetch           => KafkaVersionRange { min: 4, max: 11 }
+        KafkaListOffsets     => KafkaVersionRange { min: 1, max: 6 }
+        KafkaMetadata        => KafkaVersionRange { min: 1, max: 9 }
+        KafkaOffsetCommit    => KafkaVersionRange { min: 2, max: 8 }
+        KafkaOffsetFetch     => KafkaVersionRange { min: 1, max: 6 }
+        KafkaFindCoordinator => KafkaVersionRange { min: 0, max: 3 }
+        KafkaJoinGroup       => KafkaVersionRange { min: 0, max: 6 }
+        KafkaHeartbeat       => KafkaVersionRange { min: 0, max: 4 }
+        KafkaSyncGroup       => KafkaVersionRange { min: 0, max: 4 }
+        KafkaApiVersions     => KafkaVersionRange { min: 0, max: 3 }
 
 // The first version of this API that uses the KIP-482 flexible
 // spelling.
@@ -163,7 +242,18 @@ pub fn supported_versions(k: KafkaApiKey) -> KafkaVersionRange
 // is no cluster-wide flexible flag and no way to derive this from
 // anything — it is a table, and this is the table.
 pub fn flexible_from(k: KafkaApiKey) -> Int
-    todo("kafka-codec-nv.kafkaapi.flexible_from")
+    match k
+        KafkaProduce         => 9
+        KafkaFetch           => 12
+        KafkaListOffsets     => 6
+        KafkaMetadata        => 9
+        KafkaOffsetCommit    => 8
+        KafkaOffsetFetch     => 6
+        KafkaFindCoordinator => 3
+        KafkaJoinGroup       => 6
+        KafkaHeartbeat       => 4
+        KafkaSyncGroup       => 4
+        KafkaApiVersions     => 3
 
 // Whether a given version of this API uses the flexible spelling.
 //
@@ -175,7 +265,7 @@ pub fn flexible_from(k: KafkaApiKey) -> Int
 //     println("${kafkaapi.is_flexible(KafkaMetadata, 8)}")       // false
 // ```
 pub fn is_flexible(k: KafkaApiKey, version: Int) -> Bool
-    todo("kafka-codec-nv.kafkaapi.is_flexible")
+    version >= flexible_from(k)
 
 // The wire style a given version of this API is written in.
 //
@@ -193,7 +283,10 @@ pub fn is_flexible(k: KafkaApiKey, version: Int) -> Bool
 //     println("${kafkaprim.remaining(c)}")
 // ```
 pub fn wire_style(k: KafkaApiKey, version: Int) -> kafkaprim.KafkaWireStyle
-    todo("kafka-codec-nv.kafkaapi.wire_style")
+    if is_flexible(k, version)
+        kafkaprim.KafkaFlexible
+    else
+        kafkaprim.KafkaClassic
 
 // Which request header version precedes this request.
 //
@@ -202,7 +295,10 @@ pub fn wire_style(k: KafkaApiKey, version: Int) -> kafkaprim.KafkaWireStyle
 // tagged-field section.  Header v0, which has no client id, is used by
 // one request this package does not encode and so never answered here.
 pub fn header_request_version(k: KafkaApiKey, version: Int) -> Int
-    todo("kafka-codec-nv.kafkaapi.header_request_version")
+    if is_flexible(k, version)
+        2
+    else
+        1
 
 // Which response header version precedes this response.
 //
@@ -224,7 +320,12 @@ pub fn header_request_version(k: KafkaApiKey, version: Int) -> Int
 //     println("${kafkaapi.header_response_version(KafkaMetadata, 9)}")      // 1
 // ```
 pub fn header_response_version(k: KafkaApiKey, version: Int) -> Int
-    todo("kafka-codec-nv.kafkaapi.header_response_version")
+    if k == KafkaApiVersions
+        0
+    elif is_flexible(k, version)
+        1
+    else
+        0
 
 // The highest version of a key that both this package and the broker
 // speak.
@@ -245,7 +346,25 @@ pub fn header_response_version(k: KafkaApiKey, version: Int) -> Int
 //         Err(_) => println("no version in common")
 // ```
 pub fn negotiate(k: KafkaApiKey, broker: [KafkaApiSupport]) -> Result<Int, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaapi.negotiate")
+    let key = api_key_number(k)
+    let ours = supported_versions(k)
+    var found = false
+    var best = 0
+    for s in broker
+        if s.key == key
+            let lo = higher(s.min_version, ours.min)
+            let hi = lower(s.max_version, ours.max)
+            if lo <= hi and (not found or hi > best)
+                best = hi
+                found = true
+    if found
+        return Ok(best)
+    if listed_at(broker, key)
+        return Err(kafkaerror.KafkaUnsupportedVersion(key, 0, ours.min, ours.max))
+    // A version of `-1` says "the broker did not list the key at all";
+    // `fault_message` reads it that way, and no real version is
+    // negative.
+    Err(kafkaerror.KafkaUnsupportedVersion(key, -1, ours.min, ours.max))
 
 // Negotiate every key this package encodes at once.
 //
@@ -257,7 +376,14 @@ pub fn negotiate(k: KafkaApiKey, broker: [KafkaApiSupport]) -> Result<Int, kafka
 // for — so a client can produce to a broker too old for the consumer
 // group APIs without being refused a connection.
 pub fn negotiate_all(broker: [KafkaApiSupport]) -> [KafkaApiSupport]
-    todo("kafka-codec-nv.kafkaapi.negotiate_all")
+    var out: [KafkaApiSupport] = []
+    for k in all_api_keys()
+        let chosen = negotiated_version(k, broker)
+        if let Some(v) = chosen
+            out = list.push(out, KafkaApiSupport { key: api_key_number(k),
+                                                   min_version: v,
+                                                   max_version: v })
+    out
 
 // Whether a version of a key is one this package encodes.
 //
@@ -268,7 +394,8 @@ pub fn negotiate_all(broker: [KafkaApiSupport]) -> [KafkaApiSupport]
 //     println("${kafkaapi.supports(KafkaHeartbeat, 4)}")
 // ```
 pub fn supports(k: KafkaApiKey, version: Int) -> Bool
-    todo("kafka-codec-nv.kafkaapi.supports")
+    let r = supported_versions(k)
+    version >= r.min and version <= r.max
 
 // Refuse a version this package does not encode, naming the range it
 // does.
@@ -276,7 +403,10 @@ pub fn supports(k: KafkaApiKey, version: Int) -> Bool
 // Every encoder and decoder in the package starts with this call, so
 // the refusal is the same sentence wherever it comes from.
 pub fn check_version(k: KafkaApiKey, version: Int) -> ?kafkaerror.KafkaFault
-    todo("kafka-codec-nv.kafkaapi.check_version")
+    if supports(k, version)
+        return None
+    let r = supported_versions(k)
+    Some(kafkaerror.KafkaUnsupportedVersion(api_key_number(k), version, r.min, r.max))
 
 // The names of the API keys this release deliberately does not
 // encode.
@@ -302,7 +432,12 @@ pub fn check_version(k: KafkaApiKey, version: Int) -> ?kafkaerror.KafkaFault
 //     println("${list.len(kafkaapi.unencoded_api_keys())} keys are left out")
 // ```
 pub fn unencoded_api_keys() -> [Str]
-    todo("kafka-codec-nv.kafkaapi.unencoded_api_keys")
+    ["LeaveGroup", "DescribeGroups", "ListGroups", "SaslHandshake",
+     "SaslAuthenticate", "CreateTopics", "DeleteTopics", "CreatePartitions",
+     "DescribeConfigs", "AlterConfigs", "DeleteGroups", "DeleteRecords",
+     "OffsetForLeaderEpoch", "InitProducerId", "AddPartitionsToTxn",
+     "AddOffsetsToTxn", "EndTxn", "TxnOffsetCommit", "WriteTxnMarkers",
+     "DescribeCluster", "DescribeProducers", "ConsumerGroupHeartbeat"]
 
 // Every key this package does encode.
 //
@@ -310,4 +445,6 @@ pub fn unencoded_api_keys() -> [Str]
 // what a test iterates to assert that every key has a version range, a
 // flexible floor and a header version.
 pub fn all_api_keys() -> [KafkaApiKey]
-    todo("kafka-codec-nv.kafkaapi.all_api_keys")
+    [KafkaProduce, KafkaFetch, KafkaListOffsets, KafkaMetadata,
+     KafkaOffsetCommit, KafkaOffsetFetch, KafkaFindCoordinator,
+     KafkaJoinGroup, KafkaHeartbeat, KafkaSyncGroup, KafkaApiVersions]

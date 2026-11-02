@@ -1,8 +1,6 @@
 // kafkaerror.nv — the two kinds of refusal: the code a broker puts in
 // a response, and the fault this codec raises about the bytes.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE TWO ARE NOT THE SAME THING, AND MERGING THEM LOSES THE ONE FACT
 // A CALLER NEEDS.  A broker error code arrives inside a well-formed
 // response: the bytes decoded, the protocol worked, and the cluster is
@@ -295,10 +293,8 @@ pub enum KafkaFault
 impl Error for KafkaFault
     // The one-line message: `kafkaerror.fault_message`'s sentence,
     // naming what the bytes did and the offset it happened at.
-    //
-    // Panics with `not implemented` until the bodies land.
     fn message(self) -> Str
-        todo("kafka-codec-nv.KafkaFault.message")
+        fault_message(self)
 
 // The number a broker puts on the wire for this code.
 //
@@ -313,7 +309,64 @@ impl Error for KafkaFault
 //     println("${kafkaerror.error_code_number(KafkaErrNotCoordinator)}")   // 16
 // ```
 pub fn error_code_number(c: KafkaErrorCode) -> Int
-    todo("kafka-codec-nv.kafkaerror.error_code_number")
+    match c
+        KafkaErrNone                         => 0
+        KafkaErrUnknownServer                => -1
+        KafkaErrOffsetOutOfRange             => 1
+        KafkaErrCorruptMessage               => 2
+        KafkaErrUnknownTopicOrPartition      => 3
+        KafkaErrInvalidFetchSize             => 4
+        KafkaErrLeaderNotAvailable           => 5
+        KafkaErrNotLeaderOrFollower          => 6
+        KafkaErrRequestTimedOut              => 7
+        KafkaErrBrokerNotAvailable           => 8
+        KafkaErrReplicaNotAvailable          => 9
+        KafkaErrMessageTooLarge              => 10
+        KafkaErrOffsetMetadataTooLarge       => 12
+        KafkaErrNetworkException             => 13
+        KafkaErrCoordinatorLoadInProgress    => 14
+        KafkaErrCoordinatorNotAvailable      => 15
+        KafkaErrNotCoordinator               => 16
+        KafkaErrInvalidTopic                 => 17
+        KafkaErrRecordListTooLarge           => 18
+        KafkaErrNotEnoughReplicas            => 19
+        KafkaErrNotEnoughReplicasAfterAppend => 20
+        KafkaErrInvalidRequiredAcks          => 21
+        KafkaErrIllegalGeneration            => 22
+        KafkaErrInconsistentGroupProtocol    => 23
+        KafkaErrInvalidGroupId               => 24
+        KafkaErrUnknownMemberId              => 25
+        KafkaErrInvalidSessionTimeout        => 26
+        KafkaErrRebalanceInProgress          => 27
+        KafkaErrInvalidCommitOffsetSize      => 28
+        KafkaErrTopicAuthorizationFailed     => 29
+        KafkaErrGroupAuthorizationFailed     => 30
+        KafkaErrClusterAuthorizationFailed   => 31
+        KafkaErrInvalidTimestamp             => 32
+        KafkaErrUnsupportedSaslMechanism     => 33
+        KafkaErrIllegalSaslState             => 34
+        KafkaErrUnsupportedVersion           => 35
+        KafkaErrTopicAlreadyExists           => 36
+        KafkaErrInvalidPartitions            => 37
+        KafkaErrInvalidReplicationFactor     => 38
+        KafkaErrNotController                => 41
+        KafkaErrInvalidRequest               => 42
+        KafkaErrUnsupportedForMessageFormat  => 43
+        KafkaErrPolicyViolation              => 44
+        KafkaErrOutOfOrderSequence           => 45
+        KafkaErrDuplicateSequence            => 46
+        KafkaErrInvalidProducerEpoch         => 47
+        KafkaErrStorageError                 => 56
+        KafkaErrSaslAuthenticationFailed     => 58
+        KafkaErrFencedLeaderEpoch            => 68
+        KafkaErrUnknownLeaderEpoch           => 69
+        KafkaErrUnsupportedCompressionType   => 70
+        KafkaErrOffsetNotAvailable           => 72
+        KafkaErrMemberIdRequired             => 73
+        KafkaErrGroupMaxSizeReached          => 75
+        KafkaErrFencedInstanceId             => 76
+        KafkaErrUnstableOffsetCommit         => 79
+        KafkaErrOther(code)                  => code
 
 // The code a number denotes, or `KafkaErrOther` carrying it.
 //
@@ -327,7 +380,68 @@ pub fn error_code_number(c: KafkaErrorCode) -> Int
 //     println(kafkaerror.error_code_name(kafkaerror.error_code_of_number(999)))
 // ```
 pub fn error_code_of_number(n: Int) -> KafkaErrorCode
-    todo("kafka-codec-nv.kafkaerror.error_code_of_number")
+    // `-1` is taken by a guard rather than by a `-1 =>` arm: a negative
+    // literal is a parse error in pattern position on 0.20.2 — see
+    // `language/a-negative-literal-is-not-a-match-pattern`.
+    if n == -1
+        return KafkaErrUnknownServer
+    match n
+        0  => KafkaErrNone
+        1  => KafkaErrOffsetOutOfRange
+        2  => KafkaErrCorruptMessage
+        3  => KafkaErrUnknownTopicOrPartition
+        4  => KafkaErrInvalidFetchSize
+        5  => KafkaErrLeaderNotAvailable
+        6  => KafkaErrNotLeaderOrFollower
+        7  => KafkaErrRequestTimedOut
+        8  => KafkaErrBrokerNotAvailable
+        9  => KafkaErrReplicaNotAvailable
+        10 => KafkaErrMessageTooLarge
+        12 => KafkaErrOffsetMetadataTooLarge
+        13 => KafkaErrNetworkException
+        14 => KafkaErrCoordinatorLoadInProgress
+        15 => KafkaErrCoordinatorNotAvailable
+        16 => KafkaErrNotCoordinator
+        17 => KafkaErrInvalidTopic
+        18 => KafkaErrRecordListTooLarge
+        19 => KafkaErrNotEnoughReplicas
+        20 => KafkaErrNotEnoughReplicasAfterAppend
+        21 => KafkaErrInvalidRequiredAcks
+        22 => KafkaErrIllegalGeneration
+        23 => KafkaErrInconsistentGroupProtocol
+        24 => KafkaErrInvalidGroupId
+        25 => KafkaErrUnknownMemberId
+        26 => KafkaErrInvalidSessionTimeout
+        27 => KafkaErrRebalanceInProgress
+        28 => KafkaErrInvalidCommitOffsetSize
+        29 => KafkaErrTopicAuthorizationFailed
+        30 => KafkaErrGroupAuthorizationFailed
+        31 => KafkaErrClusterAuthorizationFailed
+        32 => KafkaErrInvalidTimestamp
+        33 => KafkaErrUnsupportedSaslMechanism
+        34 => KafkaErrIllegalSaslState
+        35 => KafkaErrUnsupportedVersion
+        36 => KafkaErrTopicAlreadyExists
+        37 => KafkaErrInvalidPartitions
+        38 => KafkaErrInvalidReplicationFactor
+        41 => KafkaErrNotController
+        42 => KafkaErrInvalidRequest
+        43 => KafkaErrUnsupportedForMessageFormat
+        44 => KafkaErrPolicyViolation
+        45 => KafkaErrOutOfOrderSequence
+        46 => KafkaErrDuplicateSequence
+        47 => KafkaErrInvalidProducerEpoch
+        56 => KafkaErrStorageError
+        58 => KafkaErrSaslAuthenticationFailed
+        68 => KafkaErrFencedLeaderEpoch
+        69 => KafkaErrUnknownLeaderEpoch
+        70 => KafkaErrUnsupportedCompressionType
+        72 => KafkaErrOffsetNotAvailable
+        73 => KafkaErrMemberIdRequired
+        75 => KafkaErrGroupMaxSizeReached
+        76 => KafkaErrFencedInstanceId
+        79 => KafkaErrUnstableOffsetCommit
+        _  => KafkaErrOther(n)
 
 // The screaming-snake name the Kafka protocol guide gives the code:
 // `"NOT_LEADER_OR_FOLLOWER"`, `"REBALANCE_IN_PROGRESS"`.
@@ -342,7 +456,64 @@ pub fn error_code_of_number(n: Int) -> KafkaErrorCode
 //     println(kafkaerror.error_code_name(KafkaErrRebalanceInProgress))
 // ```
 pub fn error_code_name(c: KafkaErrorCode) -> Str
-    todo("kafka-codec-nv.kafkaerror.error_code_name")
+    match c
+        KafkaErrNone                         => "NONE"
+        KafkaErrUnknownServer                => "UNKNOWN_SERVER_ERROR"
+        KafkaErrOffsetOutOfRange             => "OFFSET_OUT_OF_RANGE"
+        KafkaErrCorruptMessage               => "CORRUPT_MESSAGE"
+        KafkaErrUnknownTopicOrPartition      => "UNKNOWN_TOPIC_OR_PARTITION"
+        KafkaErrInvalidFetchSize             => "INVALID_FETCH_SIZE"
+        KafkaErrLeaderNotAvailable           => "LEADER_NOT_AVAILABLE"
+        KafkaErrNotLeaderOrFollower          => "NOT_LEADER_OR_FOLLOWER"
+        KafkaErrRequestTimedOut              => "REQUEST_TIMED_OUT"
+        KafkaErrBrokerNotAvailable           => "BROKER_NOT_AVAILABLE"
+        KafkaErrReplicaNotAvailable          => "REPLICA_NOT_AVAILABLE"
+        KafkaErrMessageTooLarge              => "MESSAGE_TOO_LARGE"
+        KafkaErrOffsetMetadataTooLarge       => "OFFSET_METADATA_TOO_LARGE"
+        KafkaErrNetworkException             => "NETWORK_EXCEPTION"
+        KafkaErrCoordinatorLoadInProgress    => "COORDINATOR_LOAD_IN_PROGRESS"
+        KafkaErrCoordinatorNotAvailable      => "COORDINATOR_NOT_AVAILABLE"
+        KafkaErrNotCoordinator               => "NOT_COORDINATOR"
+        KafkaErrInvalidTopic                 => "INVALID_TOPIC_EXCEPTION"
+        KafkaErrRecordListTooLarge           => "RECORD_LIST_TOO_LARGE"
+        KafkaErrNotEnoughReplicas            => "NOT_ENOUGH_REPLICAS"
+        KafkaErrNotEnoughReplicasAfterAppend => "NOT_ENOUGH_REPLICAS_AFTER_APPEND"
+        KafkaErrInvalidRequiredAcks          => "INVALID_REQUIRED_ACKS"
+        KafkaErrIllegalGeneration            => "ILLEGAL_GENERATION"
+        KafkaErrInconsistentGroupProtocol    => "INCONSISTENT_GROUP_PROTOCOL"
+        KafkaErrInvalidGroupId               => "INVALID_GROUP_ID"
+        KafkaErrUnknownMemberId              => "UNKNOWN_MEMBER_ID"
+        KafkaErrInvalidSessionTimeout        => "INVALID_SESSION_TIMEOUT"
+        KafkaErrRebalanceInProgress          => "REBALANCE_IN_PROGRESS"
+        KafkaErrInvalidCommitOffsetSize      => "INVALID_COMMIT_OFFSET_SIZE"
+        KafkaErrTopicAuthorizationFailed     => "TOPIC_AUTHORIZATION_FAILED"
+        KafkaErrGroupAuthorizationFailed     => "GROUP_AUTHORIZATION_FAILED"
+        KafkaErrClusterAuthorizationFailed   => "CLUSTER_AUTHORIZATION_FAILED"
+        KafkaErrInvalidTimestamp             => "INVALID_TIMESTAMP"
+        KafkaErrUnsupportedSaslMechanism     => "UNSUPPORTED_SASL_MECHANISM"
+        KafkaErrIllegalSaslState             => "ILLEGAL_SASL_STATE"
+        KafkaErrUnsupportedVersion           => "UNSUPPORTED_VERSION"
+        KafkaErrTopicAlreadyExists           => "TOPIC_ALREADY_EXISTS"
+        KafkaErrInvalidPartitions            => "INVALID_PARTITIONS"
+        KafkaErrInvalidReplicationFactor     => "INVALID_REPLICATION_FACTOR"
+        KafkaErrNotController                => "NOT_CONTROLLER"
+        KafkaErrInvalidRequest               => "INVALID_REQUEST"
+        KafkaErrUnsupportedForMessageFormat  => "UNSUPPORTED_FOR_MESSAGE_FORMAT"
+        KafkaErrPolicyViolation              => "POLICY_VIOLATION"
+        KafkaErrOutOfOrderSequence           => "OUT_OF_ORDER_SEQUENCE_NUMBER"
+        KafkaErrDuplicateSequence            => "DUPLICATE_SEQUENCE_NUMBER"
+        KafkaErrInvalidProducerEpoch         => "INVALID_PRODUCER_EPOCH"
+        KafkaErrStorageError                 => "KAFKA_STORAGE_ERROR"
+        KafkaErrSaslAuthenticationFailed     => "SASL_AUTHENTICATION_FAILED"
+        KafkaErrFencedLeaderEpoch            => "FENCED_LEADER_EPOCH"
+        KafkaErrUnknownLeaderEpoch           => "UNKNOWN_LEADER_EPOCH"
+        KafkaErrUnsupportedCompressionType   => "UNSUPPORTED_COMPRESSION_TYPE"
+        KafkaErrOffsetNotAvailable           => "OFFSET_NOT_AVAILABLE"
+        KafkaErrMemberIdRequired             => "MEMBER_ID_REQUIRED"
+        KafkaErrGroupMaxSizeReached          => "GROUP_MAX_SIZE_REACHED"
+        KafkaErrFencedInstanceId             => "FENCED_INSTANCE_ID"
+        KafkaErrUnstableOffsetCommit         => "UNSTABLE_OFFSET_COMMIT"
+        KafkaErrOther(code)                  => "UNKNOWN_ERROR_CODE_${code}"
 
 // Whether sending the same request again could succeed.
 //
@@ -360,7 +531,26 @@ pub fn error_code_name(c: KafkaErrorCode) -> Str
 //     println("${kafkaerror.is_retriable(KafkaErrMessageTooLarge)}")      // false
 // ```
 pub fn is_retriable(c: KafkaErrorCode) -> Bool
-    todo("kafka-codec-nv.kafkaerror.is_retriable")
+    match c
+        KafkaErrCorruptMessage               => true
+        KafkaErrUnknownTopicOrPartition      => true
+        KafkaErrLeaderNotAvailable           => true
+        KafkaErrNotLeaderOrFollower          => true
+        KafkaErrRequestTimedOut              => true
+        KafkaErrNetworkException             => true
+        KafkaErrCoordinatorLoadInProgress    => true
+        KafkaErrCoordinatorNotAvailable      => true
+        KafkaErrNotCoordinator               => true
+        KafkaErrNotEnoughReplicas            => true
+        KafkaErrNotEnoughReplicasAfterAppend => true
+        KafkaErrRebalanceInProgress          => true
+        KafkaErrNotController                => true
+        KafkaErrStorageError                 => true
+        KafkaErrFencedLeaderEpoch            => true
+        KafkaErrUnknownLeaderEpoch           => true
+        KafkaErrOffsetNotAvailable           => true
+        KafkaErrUnstableOffsetCommit         => true
+        _                                    => false
 
 // Whether the client's partition-to-leader map is stale.
 //
@@ -377,7 +567,13 @@ pub fn is_retriable(c: KafkaErrorCode) -> Bool
 //     println("${kafkaerror.needs_metadata_refresh(KafkaErrNotLeaderOrFollower)}")
 // ```
 pub fn needs_metadata_refresh(c: KafkaErrorCode) -> Bool
-    todo("kafka-codec-nv.kafkaerror.needs_metadata_refresh")
+    match c
+        KafkaErrUnknownTopicOrPartition => true
+        KafkaErrLeaderNotAvailable      => true
+        KafkaErrNotLeaderOrFollower     => true
+        KafkaErrFencedLeaderEpoch       => true
+        KafkaErrOffsetNotAvailable      => true
+        _                               => false
 
 // Whether the client's group-coordinator cache is stale.
 //
@@ -394,12 +590,16 @@ pub fn needs_metadata_refresh(c: KafkaErrorCode) -> Bool
 //     println("${kafkaerror.needs_coordinator_refresh(KafkaErrNotCoordinator)}")
 // ```
 pub fn needs_coordinator_refresh(c: KafkaErrorCode) -> Bool
-    todo("kafka-codec-nv.kafkaerror.needs_coordinator_refresh")
+    match c
+        KafkaErrCoordinatorLoadInProgress => true
+        KafkaErrCoordinatorNotAvailable   => true
+        KafkaErrNotCoordinator            => true
+        _                                 => false
 
 // Whether the operation was refused because the caller lacks
 // permission.
 //
-// The four `*_AUTHORIZATION_FAILED` codes and
+// The three `*_AUTHORIZATION_FAILED` codes and
 // `KafkaErrSaslAuthenticationFailed`.  Separated because they are the
 // set a client must never retry and must surface to a person: a
 // permission that is missing at one o'clock is missing at two.
@@ -411,7 +611,12 @@ pub fn needs_coordinator_refresh(c: KafkaErrorCode) -> Bool
 //     println("${kafkaerror.is_authorization_failure(KafkaErrTopicAuthorizationFailed)}")
 // ```
 pub fn is_authorization_failure(c: KafkaErrorCode) -> Bool
-    todo("kafka-codec-nv.kafkaerror.is_authorization_failure")
+    match c
+        KafkaErrTopicAuthorizationFailed   => true
+        KafkaErrGroupAuthorizationFailed   => true
+        KafkaErrClusterAuthorizationFailed => true
+        KafkaErrSaslAuthenticationFailed   => true
+        _                                  => false
 
 // One line naming what went wrong, for a report a person reads.
 //
@@ -422,7 +627,27 @@ pub fn is_authorization_failure(c: KafkaErrorCode) -> Bool
 //     println(kafkaerror.fault_message(KafkaBadMagic(1)))
 // ```
 pub fn fault_message(f: KafkaFault) -> Str
-    todo("kafka-codec-nv.kafkaerror.fault_message")
+    match f
+        KafkaTruncated(o, want, field)            => "truncated at ${o}: ${field} needs ${want} more bytes"
+        KafkaBadVarint(o, detail)                 => "bad variable-length integer at ${o}: ${detail}"
+        KafkaNullNotAllowed(o, field)             => "null at ${o} in ${field}, which the protocol does not allow"
+        KafkaFrameTooLarge(declared, limit)       => "frame declares ${declared} bytes, past the caller's ceiling of ${limit}"
+        KafkaTrailingBytes(o, left)               => "${left} bytes left over at ${o}: the version is probably wrong"
+        KafkaUnknownApiKey(key)                   => "API key ${key} is not one this package encodes"
+        KafkaUnsupportedVersion(key, v, lo, hi)   =>
+            if v < 0
+                "the broker's ApiVersions reply does not list API key ${key}; this package supports ${lo} through ${hi}"
+            else
+                "API key ${key} has no version ${v}; this package supports ${lo} through ${hi}"
+        KafkaCorrelationMismatch(got)             => "correlation id ${got} answers no request this exchange sent"
+        KafkaBadMagic(magic)                      => "record batch magic is ${magic}, not 2"
+        KafkaBadCrc(want, got)                    => "record batch CRC is ${got}, not the ${want} its body computes"
+        KafkaUnknownCompression(id)               => "compression codec ${id} is not one of the five this protocol names"
+        KafkaCompressionNotSupplied(codec)        => "the batch uses ${codec} and the codec set has no ${codec} function"
+        KafkaCodecFailed(codec, detail)           => "the ${codec} codec failed: ${detail}"
+        KafkaRecordCountMismatch(declared, found) => "the batch declares ${declared} records and holds ${found}"
+        KafkaNotEncodable(field, detail)          => "${field} cannot be encoded: ${detail}"
+        KafkaBadTaggedFields(o, detail)           => "bad tagged-field section at ${o}: ${detail}"
 
 // A short stable word for a metric label: `"truncated"`,
 // `"bad_crc"`, `"unknown_api_key"`.
@@ -437,7 +662,23 @@ pub fn fault_message(f: KafkaFault) -> Str
 //     println(kafkaerror.fault_code(KafkaBadCrc(1, 2)))                 // bad_crc
 // ```
 pub fn fault_code(f: KafkaFault) -> Str
-    todo("kafka-codec-nv.kafkaerror.fault_code")
+    match f
+        KafkaTruncated(_, _, _)             => "truncated"
+        KafkaBadVarint(_, _)                => "bad_varint"
+        KafkaNullNotAllowed(_, _)           => "null_not_allowed"
+        KafkaFrameTooLarge(_, _)            => "frame_too_large"
+        KafkaTrailingBytes(_, _)            => "trailing_bytes"
+        KafkaUnknownApiKey(_)               => "unknown_api_key"
+        KafkaUnsupportedVersion(_, _, _, _) => "unsupported_version"
+        KafkaCorrelationMismatch(_)         => "correlation_mismatch"
+        KafkaBadMagic(_)                    => "bad_magic"
+        KafkaBadCrc(_, _)                   => "bad_crc"
+        KafkaUnknownCompression(_)          => "unknown_compression"
+        KafkaCompressionNotSupplied(_)      => "compression_not_supplied"
+        KafkaCodecFailed(_, _)              => "codec_failed"
+        KafkaRecordCountMismatch(_, _)      => "record_count_mismatch"
+        KafkaNotEncodable(_, _)             => "not_encodable"
+        KafkaBadTaggedFields(_, _)          => "bad_tagged_fields"
 
 // Whether the fault means the connection must be closed rather than
 // the request retried.
@@ -455,4 +696,8 @@ pub fn fault_code(f: KafkaFault) -> Str
 //     println("${kafkaerror.is_fatal_to_connection(KafkaCorrelationMismatch(7))}")
 // ```
 pub fn is_fatal_to_connection(f: KafkaFault) -> Bool
-    todo("kafka-codec-nv.kafkaerror.is_fatal_to_connection")
+    match f
+        KafkaBadVarint(_, _)        => true
+        KafkaTrailingBytes(_, _)    => true
+        KafkaCorrelationMismatch(_) => true
+        _                           => false

@@ -1,8 +1,6 @@
 // kafkaresp.nv — the eleven replies, as values, and the one function
 // that reads any of them out of bytes.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A RESPONSE'S SHAPE IS NOT IN ITS BYTES.  A Kafka response body has
 // no type tag, no length of its own and no version marker: it is
 // whatever the request's API key and version said it would be.  So
@@ -37,7 +35,962 @@
 
 use kafkaapi
 use kafkaerror
+use kafkahdr
+use kafkaprim
 use kafkarecords
+
+// ── the eleven bodies, decoded and encoded ───────────────────────────
+//
+// One decoder and one encoder per arm, and `decode_response` and
+// `encode_response` are the only callers.  Each writes the fields the
+// version has and nothing else — WHICH VERSION CARRIES WHICH FIELD IS
+// THE WHOLE OF THIS MODULE, and it is written out once per key rather
+// than derived, because no two keys were converted in the same release.
+//
+// THE VERSION IS ALWAYS THE MESSAGE'S OWN.  A response is decoded at
+// the version its request was sent at, and that number decides three
+// things: which fields are present, which spelling they use, and which
+// header precedes them.  `kafkaapi.wire_style` answers the spelling and
+// `kafkaapi.header_response_version` the header; both are asked by the
+// callers, not here.
+//
+// A FIELD THIS RELEASE DOES NOT MODEL IS STILL CONSUMED.  A `Metadata`
+// reply at v8 and v9 carries authorized-operations counts in two places
+// and this package's response structs have no field for either; a
+// `Produce` reply at v8 and v9 carries per-record errors and an error
+// message.  A decoder that stopped reading at the last modelled field
+// would report `KafkaTrailingBytes` on every such reply, so those
+// fields are read and dropped, and the encoders write the protocol's
+// own "no information" value for them.
+
+struct KafkaBodyRead
+    response: KafkaResponse
+    cursor: kafkaprim.KafkaCursor
+
+// The int32 the protocol uses for "no information" about
+// authorized operations — the high bit of a signed 32-bit field, and
+// what a broker sends for a request that did not ask.  A function
+// rather than a literal at each of the four sites so the four cannot
+// drift apart.
+fn authorized_none() -> Int
+    2147483648
+
+// An error code and the cursor after it.
+struct KafkaCodeRead
+    cursor: kafkaprim.KafkaCursor
+    code: kafkaerror.KafkaErrorCode
+
+// An error code, from the two bytes a response carries it in.  The
+// code travels as the typed enum, never as the number: an unrecognised
+// number is `KafkaErrOther` carrying it, which is the rule the whole
+// package follows.
+fn read_error_code(c: kafkaprim.KafkaCursor) -> Result<KafkaCodeRead, kafkaerror.KafkaFault>
+    let r = kafkaprim.read_int16(c)!
+    Ok(KafkaCodeRead { cursor: r.cursor, code: kafkaerror.error_code_of_number(r.value) })
+
+// An array of int32s: a replica list, an in-sync list, a partition
+// index list.  A null array reads as an empty one.
+struct KafkaIntsRead
+    cursor: kafkaprim.KafkaCursor
+    values: [Int]
+
+fn read_int_array(c: kafkaprim.KafkaCursor) -> Result<KafkaIntsRead, kafkaerror.KafkaFault>
+    let n = kafkaprim.read_array_len(c)!
+    var out: [Int] = []
+    var cur = n.cursor
+    var i = 0
+    while i < n.count
+        let r = kafkaprim.read_int32(cur)!
+        out = list.push(out, r.value)
+        cur = r.cursor
+        i = i + 1
+    Ok(KafkaIntsRead { cursor: cur, values: out })
+
+fn write_int_array(w: kafkaprim.KafkaWriter,
+                   xs: [Int]) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = kafkaprim.write_array_len(w, list.len(xs))!
+    for x in xs
+        out = kafkaprim.write_int32(out, x)
+    Ok(out)
+
+// A nullable string field.
+fn put_opt_str(w: kafkaprim.KafkaWriter, text: Str,
+               is_null: Bool) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    if is_null
+        return Ok(kafkaprim.write_null_str(w))
+    Ok(kafkaprim.write_str(w, text)!)
+
+// A record set as a fetch reply carries it: nullable, and its bytes are
+// whole batches.
+fn read_record_set(r: kafkaprim.KafkaBytesRead,
+                   set: kafkarecords.KafkaCodecSet) -> Result<[kafkarecords.KafkaRecordBatch], kafkaerror.KafkaFault>
+    if r.is_null
+        return Ok([])
+    kafkarecords.decode_batches(r.value, set)
+
+fn write_record_set(w: kafkaprim.KafkaWriter, batches: [kafkarecords.KafkaRecordBatch],
+                    set: kafkarecords.KafkaCodecSet) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    if list.len(batches) == 0
+        // A broker writes a null record set for a partition it has
+        // nothing to send for, and a client reads null and empty the
+        // same way here.
+        return Ok(kafkaprim.write_null_bytes(w))
+    var parts: [Bytes] = []
+    for b in batches
+        parts = list.push(parts, kafkarecords.encode_batch(b, set)!)
+    kafkaprim.write_bytes(w, bytes.concat(parts))
+
+// ── ApiVersions ──────────────────────────────────────────────────────
+
+fn decode_api_versions_body(c: kafkaprim.KafkaCursor,
+                            version: Int) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    let code_r = read_error_code(c)!
+    let keys_r = kafkaprim.read_array_len(code_r.cursor)!
+    var supports: [kafkaapi.KafkaApiSupport] = []
+    var cur = keys_r.cursor
+    var i = 0
+    while i < keys_r.count
+        let k_r = kafkaprim.read_int16(cur)!
+        let lo_r = kafkaprim.read_int16(k_r.cursor)!
+        let hi_r = kafkaprim.read_int16(lo_r.cursor)!
+        let tags_r = kafkaprim.read_tagged_fields(hi_r.cursor)!
+        let s = KafkaApiSupport { key: k_r.value, min_version: lo_r.value, max_version: hi_r.value }
+        supports = list.push(supports, s)
+        cur = tags_r.cursor
+        i = i + 1
+    // v1 added the throttle; v0 has none and zero is what "none" reads
+    // as.
+    var throttle = 0
+    if version >= 1
+        let t_r = kafkaprim.read_int32(cur)!
+        throttle = t_r.value
+        cur = t_r.cursor
+    let end_r = kafkaprim.read_tagged_fields(cur)!
+    let v = KafkaApiVersionsResponse { error_code: code_r.code, api_keys: supports,
+                                       throttle_time_ms: throttle }
+    Ok(KafkaBodyRead { response: KafkaApiVersionsResp(v), cursor: end_r.cursor })
+
+fn encode_api_versions_body(w: kafkaprim.KafkaWriter, version: Int,
+                            v: KafkaApiVersionsResponse) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = kafkaprim.write_int16(w, kafkaerror.error_code_number(v.error_code))
+    out = kafkaprim.write_array_len(out, list.len(v.api_keys))!
+    for s in v.api_keys
+        out = kafkaprim.write_int16(out, s.key)
+        out = kafkaprim.write_int16(out, s.min_version)
+        out = kafkaprim.write_int16(out, s.max_version)
+        out = kafkaprim.write_tagged_fields(out, [])
+    if version >= 1
+        out = kafkaprim.write_int32(out, v.throttle_time_ms)
+    out = kafkaprim.write_tagged_fields(out, [])
+    Ok(out)
+
+// ── Fetch ────────────────────────────────────────────────────────────
+
+fn decode_fetch_body(c: kafkaprim.KafkaCursor, version: Int,
+                     set: kafkarecords.KafkaCodecSet) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    let throttle_r = kafkaprim.read_int32(c)!
+    var code = kafkaerror.KafkaErrNone
+    var session = 0
+    var cur = throttle_r.cursor
+    // v7 added the session error code and the session id, in that
+    // order, right after the throttle.
+    if version >= 7
+        let code_r = read_error_code(cur)!
+        let session_r = kafkaprim.read_int32(code_r.cursor)!
+        code = code_r.code
+        session = session_r.value
+        cur = session_r.cursor
+    let topics_l = kafkaprim.read_array_len(cur)!
+    var topics: [KafkaFetchTopicResult] = []
+    cur = topics_l.cursor
+    var t = 0
+    while t < topics_l.count
+        let name_r = kafkaprim.read_required_str(cur, "topic name")!
+        let parts_l = kafkaprim.read_array_len(name_r.cursor)!
+        var parts: [KafkaFetchResult] = []
+        cur = parts_l.cursor
+        var i = 0
+        while i < parts_l.count
+            let idx_r = kafkaprim.read_int32(cur)!
+            let pcode_r = read_error_code(idx_r.cursor)!
+            let hw_r = kafkaprim.read_int64(pcode_r.cursor)!
+            let stable_r = kafkaprim.read_int64(hw_r.cursor)!
+            var log_start = -1
+            var after_stable = stable_r.cursor
+            if version >= 5
+                let ls_r = kafkaprim.read_int64(after_stable)!
+                log_start = ls_r.value
+                after_stable = ls_r.cursor
+            // Aborted transactions arrived at v4, the floor of this
+            // release's range, so every version here carries them.
+            let aborted_l = kafkaprim.read_array_len(after_stable)!
+            var aborted: [KafkaAbortedTransaction] = []
+            var acur = aborted_l.cursor
+            var a = 0
+            while a < aborted_l.count
+                let pid_r = kafkaprim.read_int64(acur)!
+                let first_r = kafkaprim.read_int64(pid_r.cursor)!
+                let atags_r = kafkaprim.read_tagged_fields(first_r.cursor)!
+                aborted = list.push(aborted, KafkaAbortedTransaction { producer_id: pid_r.value,
+                                                                       first_offset: first_r.value })
+                acur = atags_r.cursor
+                a = a + 1
+            var preferred = -1
+            var after_aborted = acur
+            if version >= 11
+                let pref_r = kafkaprim.read_int32(after_aborted)!
+                preferred = pref_r.value
+                after_aborted = pref_r.cursor
+            let rec_r = kafkaprim.read_bytes(after_aborted)!
+            let batches = read_record_set(rec_r, set)!
+            let ptags_r = kafkaprim.read_tagged_fields(rec_r.cursor)!
+            parts = list.push(parts, KafkaFetchResult { index: idx_r.value,
+                                                        error_code: pcode_r.code,
+                                                        high_watermark: hw_r.value,
+                                                        last_stable_offset: stable_r.value,
+                                                        log_start_offset: log_start,
+                                                        aborted_transactions: aborted,
+                                                        preferred_read_replica: preferred,
+                                                        batches: batches })
+            cur = ptags_r.cursor
+            i = i + 1
+        let ttags_r = kafkaprim.read_tagged_fields(cur)!
+        topics = list.push(topics, KafkaFetchTopicResult { name: name_r.value, partitions: parts })
+        cur = ttags_r.cursor
+        t = t + 1
+    let end_r = kafkaprim.read_tagged_fields(cur)!
+    let v = KafkaFetchResponse { throttle_time_ms: throttle_r.value, error_code: code,
+                                 session_id: session, topics: topics }
+    Ok(KafkaBodyRead { response: KafkaFetchResp(v), cursor: end_r.cursor })
+
+fn encode_fetch_body(w: kafkaprim.KafkaWriter, version: Int, v: KafkaFetchResponse,
+                     set: kafkarecords.KafkaCodecSet) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = kafkaprim.write_int32(w, v.throttle_time_ms)
+    if version >= 7
+        out = kafkaprim.write_int16(out, kafkaerror.error_code_number(v.error_code))
+        out = kafkaprim.write_int32(out, v.session_id)
+    out = kafkaprim.write_array_len(out, list.len(v.topics))!
+    for t in v.topics
+        out = kafkaprim.write_str(out, t.name)!
+        out = kafkaprim.write_array_len(out, list.len(t.partitions))!
+        for p in t.partitions
+            out = kafkaprim.write_int32(out, p.index)
+            out = kafkaprim.write_int16(out, kafkaerror.error_code_number(p.error_code))
+            out = kafkaprim.write_int64(out, p.high_watermark)
+            out = kafkaprim.write_int64(out, p.last_stable_offset)
+            if version >= 5
+                out = kafkaprim.write_int64(out, p.log_start_offset)
+            out = kafkaprim.write_array_len(out, list.len(p.aborted_transactions))!
+            for a in p.aborted_transactions
+                out = kafkaprim.write_int64(out, a.producer_id)
+                out = kafkaprim.write_int64(out, a.first_offset)
+                out = kafkaprim.write_tagged_fields(out, [])
+            if version >= 11
+                out = kafkaprim.write_int32(out, p.preferred_read_replica)
+            out = write_record_set(out, p.batches, set)!
+            out = kafkaprim.write_tagged_fields(out, [])
+        out = kafkaprim.write_tagged_fields(out, [])
+    out = kafkaprim.write_tagged_fields(out, [])
+    Ok(out)
+
+// ── Metadata ─────────────────────────────────────────────────────────
+
+fn decode_metadata_body(c: kafkaprim.KafkaCursor,
+                        version: Int) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    var cur = c
+    // v3 moved the throttle to the front of the body.
+    var throttle = 0
+    if version >= 3
+        let t_r = kafkaprim.read_int32(cur)!
+        throttle = t_r.value
+        cur = t_r.cursor
+    let brokers_l = kafkaprim.read_array_len(cur)!
+    var brokers: [KafkaBrokerInfo] = []
+    cur = brokers_l.cursor
+    var i = 0
+    while i < brokers_l.count
+        let node_r = kafkaprim.read_int32(cur)!
+        let host_r = kafkaprim.read_required_str(node_r.cursor, "broker host")!
+        let port_r = kafkaprim.read_int32(host_r.cursor)!
+        let rack_r = kafkaprim.read_str(port_r.cursor)!
+        let tags_r = kafkaprim.read_tagged_fields(rack_r.cursor)!
+        brokers = list.push(brokers, KafkaBrokerInfo { node_id: node_r.value, host: host_r.value,
+                                                       port: port_r.value, rack: rack_r.value,
+                                                       rack_is_null: rack_r.is_null })
+        cur = tags_r.cursor
+        i = i + 1
+    // v2 added the cluster id, which is nullable because a broker that
+    // is not in a cluster has none.
+    var cluster = ""
+    if version >= 2
+        let cl_r = kafkaprim.read_str(cur)!
+        cluster = cl_r.value
+        cur = cl_r.cursor
+    let ctrl_r = kafkaprim.read_int32(cur)!
+    let topics_l = kafkaprim.read_array_len(ctrl_r.cursor)!
+    var topics: [KafkaTopicInfo] = []
+    cur = topics_l.cursor
+    var t = 0
+    while t < topics_l.count
+        let code_r = read_error_code(cur)!
+        let name_r = kafkaprim.read_required_str(code_r.cursor, "topic name")!
+        let internal_r = kafkaprim.read_bool(name_r.cursor)!
+        let parts_l = kafkaprim.read_array_len(internal_r.cursor)!
+        var parts: [KafkaPartitionInfo] = []
+        cur = parts_l.cursor
+        var j = 0
+        while j < parts_l.count
+            let pcode_r = read_error_code(cur)!
+            let idx_r = kafkaprim.read_int32(pcode_r.cursor)!
+            let leader_r = kafkaprim.read_int32(idx_r.cursor)!
+            var epoch = -1
+            var after_leader = leader_r.cursor
+            if version >= 7
+                let ep_r = kafkaprim.read_int32(after_leader)!
+                epoch = ep_r.value
+                after_leader = ep_r.cursor
+            let reps_r = read_int_array(after_leader)!
+            let isr_r = read_int_array(reps_r.cursor)!
+            var offline: [Int] = []
+            var after_isr = isr_r.cursor
+            if version >= 5
+                let off_r = read_int_array(after_isr)!
+                offline = list.clone(off_r.values)
+                after_isr = off_r.cursor
+            let ptags_r = kafkaprim.read_tagged_fields(after_isr)!
+            parts = list.push(parts, KafkaPartitionInfo { error_code: pcode_r.code,
+                                                          index: idx_r.value,
+                                                          leader_id: leader_r.value,
+                                                          leader_epoch: epoch,
+                                                          replica_nodes: reps_r.values,
+                                                          isr_nodes: isr_r.values,
+                                                          offline_replicas: offline })
+            cur = ptags_r.cursor
+            j = j + 1
+        // v8's per-topic authorized operations: read and dropped, since
+        // no field of `KafkaTopicInfo` holds it.
+        var after_parts = cur
+        if version >= 8
+            let auth_r = kafkaprim.read_int32(after_parts)!
+            after_parts = auth_r.cursor
+        let ttags_r = kafkaprim.read_tagged_fields(after_parts)!
+        // `topic_id` is empty at every version this release decodes:
+        // topic ids arrive at Metadata v10 and the range stops at v9.
+        topics = list.push(topics, KafkaTopicInfo { error_code: code_r.code, name: name_r.value,
+                                                    topic_id: "", is_internal: internal_r.value,
+                                                    partitions: parts })
+        cur = ttags_r.cursor
+        t = t + 1
+    if version >= 8
+        let cauth_r = kafkaprim.read_int32(cur)!
+        cur = cauth_r.cursor
+    let end_r = kafkaprim.read_tagged_fields(cur)!
+    let v = KafkaMetadataResponse { throttle_time_ms: throttle, brokers: brokers,
+                                    cluster_id: cluster, controller_id: ctrl_r.value, topics: topics }
+    Ok(KafkaBodyRead { response: KafkaMetadataResp(v), cursor: end_r.cursor })
+
+fn encode_metadata_body(w: kafkaprim.KafkaWriter, version: Int,
+                        v: KafkaMetadataResponse) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = w
+    if version >= 3
+        out = kafkaprim.write_int32(out, v.throttle_time_ms)
+    out = kafkaprim.write_array_len(out, list.len(v.brokers))!
+    for b in v.brokers
+        out = kafkaprim.write_int32(out, b.node_id)
+        out = kafkaprim.write_str(out, b.host)!
+        out = kafkaprim.write_int32(out, b.port)
+        out = put_opt_str(out, b.rack, b.rack_is_null)!
+        out = kafkaprim.write_tagged_fields(out, [])
+    if version >= 2
+        // An empty cluster id is written as null: a broker outside a
+        // cluster has none, and empty and null read the same to every
+        // client.
+        out = put_opt_str(out, v.cluster_id, str.len(v.cluster_id) == 0)!
+    out = kafkaprim.write_int32(out, v.controller_id)
+    out = kafkaprim.write_array_len(out, list.len(v.topics))!
+    for t in v.topics
+        out = kafkaprim.write_int16(out, kafkaerror.error_code_number(t.error_code))
+        out = kafkaprim.write_str(out, t.name)!
+        out = kafkaprim.write_bool(out, t.is_internal)
+        out = kafkaprim.write_array_len(out, list.len(t.partitions))!
+        for p in t.partitions
+            out = kafkaprim.write_int16(out, kafkaerror.error_code_number(p.error_code))
+            out = kafkaprim.write_int32(out, p.index)
+            out = kafkaprim.write_int32(out, p.leader_id)
+            if version >= 7
+                out = kafkaprim.write_int32(out, p.leader_epoch)
+            out = write_int_array(out, p.replica_nodes)!
+            out = write_int_array(out, p.isr_nodes)!
+            if version >= 5
+                out = write_int_array(out, p.offline_replicas)!
+            out = kafkaprim.write_tagged_fields(out, [])
+        if version >= 8
+            out = kafkaprim.write_uint32(out, authorized_none())
+        out = kafkaprim.write_tagged_fields(out, [])
+    if version >= 8
+        out = kafkaprim.write_uint32(out, authorized_none())
+    out = kafkaprim.write_tagged_fields(out, [])
+    Ok(out)
+
+// ── Produce ──────────────────────────────────────────────────────────
+
+fn decode_produce_body(c: kafkaprim.KafkaCursor,
+                       version: Int) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    let topics_l = kafkaprim.read_array_len(c)!
+    var topics: [KafkaProduceTopicResult] = []
+    var cur = topics_l.cursor
+    var t = 0
+    while t < topics_l.count
+        let name_r = kafkaprim.read_required_str(cur, "topic name")!
+        let parts_l = kafkaprim.read_array_len(name_r.cursor)!
+        var parts: [KafkaProduceResult] = []
+        cur = parts_l.cursor
+        var i = 0
+        while i < parts_l.count
+            let idx_r = kafkaprim.read_int32(cur)!
+            let code_r = read_error_code(idx_r.cursor)!
+            let base_r = kafkaprim.read_int64(code_r.cursor)!
+            let append_r = kafkaprim.read_int64(base_r.cursor)!
+            var log_start = -1
+            var after_append = append_r.cursor
+            if version >= 5
+                let ls_r = kafkaprim.read_int64(after_append)!
+                log_start = ls_r.value
+                after_append = ls_r.cursor
+            if version >= 8
+                // v8's per-record errors and its error message: read
+                // and dropped, since neither has a field here.  The
+                // message is what a broker sends for a rejected batch
+                // when the code alone is not enough.
+                let errs_l = kafkaprim.read_array_len(after_append)!
+                var e = 0
+                var ecur = errs_l.cursor
+                while e < errs_l.count
+                    let bi_r = kafkaprim.read_int32(ecur)!
+                    let bm_r = kafkaprim.read_str(bi_r.cursor)!
+                    let etags_r = kafkaprim.read_tagged_fields(bm_r.cursor)!
+                    ecur = etags_r.cursor
+                    e = e + 1
+                let msg_r = kafkaprim.read_str(ecur)!
+                after_append = msg_r.cursor
+            let ptags_r = kafkaprim.read_tagged_fields(after_append)!
+            parts = list.push(parts, KafkaProduceResult { index: idx_r.value,
+                                                          error_code: code_r.code,
+                                                          base_offset: base_r.value,
+                                                          log_append_time_ms: append_r.value,
+                                                          log_start_offset: log_start })
+            cur = ptags_r.cursor
+            i = i + 1
+        let ttags_r = kafkaprim.read_tagged_fields(cur)!
+        topics = list.push(topics, KafkaProduceTopicResult { name: name_r.value, partitions: parts })
+        cur = ttags_r.cursor
+        t = t + 1
+    // The throttle comes AFTER the results here, which is the opposite
+    // of every other response in this module.
+    let throttle_r = kafkaprim.read_int32(cur)!
+    let end_r = kafkaprim.read_tagged_fields(throttle_r.cursor)!
+    let v = KafkaProduceResponse { topics: topics, throttle_time_ms: throttle_r.value }
+    Ok(KafkaBodyRead { response: KafkaProduceResp(v), cursor: end_r.cursor })
+
+fn encode_produce_body(w: kafkaprim.KafkaWriter, version: Int,
+                       v: KafkaProduceResponse) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = kafkaprim.write_array_len(w, list.len(v.topics))!
+    for t in v.topics
+        out = kafkaprim.write_str(out, t.name)!
+        out = kafkaprim.write_array_len(out, list.len(t.partitions))!
+        for p in t.partitions
+            out = kafkaprim.write_int32(out, p.index)
+            out = kafkaprim.write_int16(out, kafkaerror.error_code_number(p.error_code))
+            out = kafkaprim.write_int64(out, p.base_offset)
+            out = kafkaprim.write_int64(out, p.log_append_time_ms)
+            if version >= 5
+                out = kafkaprim.write_int64(out, p.log_start_offset)
+            if version >= 8
+                // No per-record errors to report and no message: an
+                // empty list and a null string, which is what a broker
+                // sends for a batch it accepted.
+                out = kafkaprim.write_array_len(out, 0)!
+                out = kafkaprim.write_null_str(out)
+            out = kafkaprim.write_tagged_fields(out, [])
+        out = kafkaprim.write_tagged_fields(out, [])
+    out = kafkaprim.write_int32(out, v.throttle_time_ms)
+    out = kafkaprim.write_tagged_fields(out, [])
+    Ok(out)
+
+// ── ListOffsets ──────────────────────────────────────────────────────
+
+fn decode_list_offsets_body(c: kafkaprim.KafkaCursor,
+                            version: Int) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    var throttle = 0
+    var cur = c
+    if version >= 2
+        let t_r = kafkaprim.read_int32(cur)!
+        throttle = t_r.value
+        cur = t_r.cursor
+    let topics_l = kafkaprim.read_array_len(cur)!
+    var topics: [KafkaListOffsetsTopicResult] = []
+    cur = topics_l.cursor
+    var t = 0
+    while t < topics_l.count
+        let name_r = kafkaprim.read_required_str(cur, "topic name")!
+        let parts_l = kafkaprim.read_array_len(name_r.cursor)!
+        var parts: [KafkaListOffsetsResult] = []
+        cur = parts_l.cursor
+        var i = 0
+        while i < parts_l.count
+            let idx_r = kafkaprim.read_int32(cur)!
+            let code_r = read_error_code(idx_r.cursor)!
+            let ts_r = kafkaprim.read_int64(code_r.cursor)!
+            let off_r = kafkaprim.read_int64(ts_r.cursor)!
+            // v4 added the leader epoch; `-1` is the protocol's own
+            // "unknown epoch" and is what a v1 to v3 reply reads as.
+            var epoch = -1
+            var after_off = off_r.cursor
+            if version >= 4
+                let ep_r = kafkaprim.read_int32(after_off)!
+                epoch = ep_r.value
+                after_off = ep_r.cursor
+            let ptags_r = kafkaprim.read_tagged_fields(after_off)!
+            parts = list.push(parts, KafkaListOffsetsResult { index: idx_r.value,
+                                                              error_code: code_r.code,
+                                                              timestamp: ts_r.value,
+                                                              offset: off_r.value,
+                                                              leader_epoch: epoch })
+            cur = ptags_r.cursor
+            i = i + 1
+        let ttags_r = kafkaprim.read_tagged_fields(cur)!
+        topics = list.push(topics, KafkaListOffsetsTopicResult { name: name_r.value, partitions: parts })
+        cur = ttags_r.cursor
+        t = t + 1
+    let end_r = kafkaprim.read_tagged_fields(cur)!
+    let v = KafkaListOffsetsResponse { throttle_time_ms: throttle, topics: topics }
+    Ok(KafkaBodyRead { response: KafkaListOffsetsResp(v), cursor: end_r.cursor })
+
+fn encode_list_offsets_body(w: kafkaprim.KafkaWriter, version: Int,
+                            v: KafkaListOffsetsResponse) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = w
+    if version >= 2
+        out = kafkaprim.write_int32(out, v.throttle_time_ms)
+    out = kafkaprim.write_array_len(out, list.len(v.topics))!
+    for t in v.topics
+        out = kafkaprim.write_str(out, t.name)!
+        out = kafkaprim.write_array_len(out, list.len(t.partitions))!
+        for p in t.partitions
+            out = kafkaprim.write_int32(out, p.index)
+            out = kafkaprim.write_int16(out, kafkaerror.error_code_number(p.error_code))
+            out = kafkaprim.write_int64(out, p.timestamp)
+            out = kafkaprim.write_int64(out, p.offset)
+            if version >= 4
+                out = kafkaprim.write_int32(out, p.leader_epoch)
+            out = kafkaprim.write_tagged_fields(out, [])
+        out = kafkaprim.write_tagged_fields(out, [])
+    out = kafkaprim.write_tagged_fields(out, [])
+    Ok(out)
+
+// ── FindCoordinator ──────────────────────────────────────────────────
+
+fn decode_find_coordinator_body(c: kafkaprim.KafkaCursor,
+                                version: Int) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    var throttle = 0
+    var cur = c
+    if version >= 1
+        let t_r = kafkaprim.read_int32(cur)!
+        throttle = t_r.value
+        cur = t_r.cursor
+    let code_r = read_error_code(cur)!
+    var message = ""
+    var message_is_null = true
+    var after_code = code_r.cursor
+    // v0 has no error message; the coordinator either was found or the
+    // code said why not.
+    if version >= 1
+        let msg_r = kafkaprim.read_str(after_code)!
+        message = msg_r.value
+        message_is_null = msg_r.is_null
+        after_code = msg_r.cursor
+    let node_r = kafkaprim.read_int32(after_code)!
+    let host_r = kafkaprim.read_required_str(node_r.cursor, "coordinator host")!
+    let port_r = kafkaprim.read_int32(host_r.cursor)!
+    let end_r = kafkaprim.read_tagged_fields(port_r.cursor)!
+    let v = KafkaFindCoordinatorResponse { throttle_time_ms: throttle, error_code: code_r.code,
+                                           error_message: message,
+                                           error_message_is_null: message_is_null,
+                                           node_id: node_r.value, host: host_r.value,
+                                           port: port_r.value }
+    Ok(KafkaBodyRead { response: KafkaFindCoordinatorResp(v), cursor: end_r.cursor })
+
+fn encode_find_coordinator_body(w: kafkaprim.KafkaWriter, version: Int,
+                                v: KafkaFindCoordinatorResponse) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = w
+    if version >= 1
+        out = kafkaprim.write_int32(out, v.throttle_time_ms)
+    out = kafkaprim.write_int16(out, kafkaerror.error_code_number(v.error_code))
+    if version >= 1
+        out = put_opt_str(out, v.error_message, v.error_message_is_null)!
+    out = kafkaprim.write_int32(out, v.node_id)
+    out = kafkaprim.write_str(out, v.host)!
+    out = kafkaprim.write_int32(out, v.port)
+    out = kafkaprim.write_tagged_fields(out, [])
+    Ok(out)
+
+// ── JoinGroup ────────────────────────────────────────────────────────
+
+fn decode_join_group_body(c: kafkaprim.KafkaCursor,
+                          version: Int) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    var throttle = 0
+    var cur = c
+    if version >= 2
+        let t_r = kafkaprim.read_int32(cur)!
+        throttle = t_r.value
+        cur = t_r.cursor
+    let code_r = read_error_code(cur)!
+    let gen_r = kafkaprim.read_int32(code_r.cursor)!
+    // `protocol_type` is a v7 field and this release stops at v6, so
+    // the field reads as empty and the encoder never writes one: a
+    // protocol type would be chosen from the response, which is the
+    // wrong direction.
+    let pname_r = kafkaprim.read_required_str(gen_r.cursor, "protocol name")!
+    let leader_r = kafkaprim.read_required_str(pname_r.cursor, "leader id")!
+    let member_r = kafkaprim.read_required_str(leader_r.cursor, "member id")!
+    let members_l = kafkaprim.read_array_len(member_r.cursor)!
+    var members: [KafkaJoinGroupMember] = []
+    cur = members_l.cursor
+    var i = 0
+    while i < members_l.count
+        let mid_r = kafkaprim.read_required_str(cur, "member id")!
+        var instance = ""
+        var instance_is_null = true
+        var after_mid = mid_r.cursor
+        if version >= 5
+            let inst_r = kafkaprim.read_str(after_mid)!
+            instance = inst_r.value
+            instance_is_null = inst_r.is_null
+            after_mid = inst_r.cursor
+        let meta_r = kafkaprim.read_bytes(after_mid)!
+        let mtags_r = kafkaprim.read_tagged_fields(meta_r.cursor)!
+        members = list.push(members, KafkaJoinGroupMember { member_id: mid_r.value,
+                                                            group_instance_id: instance,
+                                                            group_instance_id_is_null: instance_is_null,
+                                                            metadata: meta_r.value })
+        cur = mtags_r.cursor
+        i = i + 1
+    let end_r = kafkaprim.read_tagged_fields(cur)!
+    let v = KafkaJoinGroupResponse { throttle_time_ms: throttle, error_code: code_r.code,
+                                     generation_id: gen_r.value, protocol_type: "",
+                                     protocol_name: pname_r.value, leader: leader_r.value,
+                                     member_id: member_r.value, members: members }
+    Ok(KafkaBodyRead { response: KafkaJoinGroupResp(v), cursor: end_r.cursor })
+
+fn encode_join_group_body(w: kafkaprim.KafkaWriter, version: Int,
+                          v: KafkaJoinGroupResponse) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = w
+    if version >= 2
+        out = kafkaprim.write_int32(out, v.throttle_time_ms)
+    out = kafkaprim.write_int16(out, kafkaerror.error_code_number(v.error_code))
+    out = kafkaprim.write_int32(out, v.generation_id)
+    out = kafkaprim.write_str(out, v.protocol_name)!
+    out = kafkaprim.write_str(out, v.leader)!
+    out = kafkaprim.write_str(out, v.member_id)!
+    out = kafkaprim.write_array_len(out, list.len(v.members))!
+    for m in v.members
+        out = kafkaprim.write_str(out, m.member_id)!
+        if version >= 5
+            out = put_opt_str(out, m.group_instance_id, m.group_instance_id_is_null)!
+        out = kafkaprim.write_bytes(out, m.metadata)!
+        out = kafkaprim.write_tagged_fields(out, [])
+    out = kafkaprim.write_tagged_fields(out, [])
+    Ok(out)
+
+// ── SyncGroup ────────────────────────────────────────────────────────
+
+fn decode_sync_group_body(c: kafkaprim.KafkaCursor,
+                          version: Int) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    var throttle = 0
+    var cur = c
+    if version >= 1
+        let t_r = kafkaprim.read_int32(cur)!
+        throttle = t_r.value
+        cur = t_r.cursor
+    let code_r = read_error_code(cur)!
+    // `protocol_type` and `protocol_name` are v5 fields and this
+    // release stops at v4, so both read as empty.
+    let assign_r = kafkaprim.read_bytes(code_r.cursor)!
+    let end_r = kafkaprim.read_tagged_fields(assign_r.cursor)!
+    let v = KafkaSyncGroupResponse { throttle_time_ms: throttle, error_code: code_r.code,
+                                     protocol_type: "", protocol_name: "",
+                                     assignment: assign_r.value }
+    Ok(KafkaBodyRead { response: KafkaSyncGroupResp(v), cursor: end_r.cursor })
+
+fn encode_sync_group_body(w: kafkaprim.KafkaWriter, version: Int,
+                          v: KafkaSyncGroupResponse) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = w
+    if version >= 1
+        out = kafkaprim.write_int32(out, v.throttle_time_ms)
+    out = kafkaprim.write_int16(out, kafkaerror.error_code_number(v.error_code))
+    out = kafkaprim.write_bytes(out, v.assignment)!
+    out = kafkaprim.write_tagged_fields(out, [])
+    Ok(out)
+
+// ── Heartbeat ────────────────────────────────────────────────────────
+
+fn decode_heartbeat_body(c: kafkaprim.KafkaCursor,
+                         version: Int) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    var throttle = 0
+    var cur = c
+    if version >= 1
+        let t_r = kafkaprim.read_int32(cur)!
+        throttle = t_r.value
+        cur = t_r.cursor
+    let code_r = read_error_code(cur)!
+    let end_r = kafkaprim.read_tagged_fields(code_r.cursor)!
+    let v = KafkaHeartbeatResponse { throttle_time_ms: throttle, error_code: code_r.code }
+    Ok(KafkaBodyRead { response: KafkaHeartbeatResp(v), cursor: end_r.cursor })
+
+fn encode_heartbeat_body(w: kafkaprim.KafkaWriter, version: Int,
+                         v: KafkaHeartbeatResponse) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = w
+    if version >= 1
+        out = kafkaprim.write_int32(out, v.throttle_time_ms)
+    out = kafkaprim.write_int16(out, kafkaerror.error_code_number(v.error_code))
+    out = kafkaprim.write_tagged_fields(out, [])
+    Ok(out)
+
+// ── OffsetCommit ─────────────────────────────────────────────────────
+
+fn decode_offset_commit_body(c: kafkaprim.KafkaCursor,
+                             version: Int) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    var throttle = 0
+    var cur = c
+    if version >= 3
+        let t_r = kafkaprim.read_int32(cur)!
+        throttle = t_r.value
+        cur = t_r.cursor
+    let topics_l = kafkaprim.read_array_len(cur)!
+    var topics: [KafkaOffsetCommitTopicResult] = []
+    cur = topics_l.cursor
+    var t = 0
+    while t < topics_l.count
+        let name_r = kafkaprim.read_required_str(cur, "topic name")!
+        let parts_l = kafkaprim.read_array_len(name_r.cursor)!
+        var parts: [KafkaOffsetCommitResult] = []
+        cur = parts_l.cursor
+        var i = 0
+        while i < parts_l.count
+            let idx_r = kafkaprim.read_int32(cur)!
+            let code_r = read_error_code(idx_r.cursor)!
+            let ptags_r = kafkaprim.read_tagged_fields(code_r.cursor)!
+            parts = list.push(parts, KafkaOffsetCommitResult { index: idx_r.value,
+                                                               error_code: code_r.code })
+            cur = ptags_r.cursor
+            i = i + 1
+        let ttags_r = kafkaprim.read_tagged_fields(cur)!
+        topics = list.push(topics, KafkaOffsetCommitTopicResult { name: name_r.value, partitions: parts })
+        cur = ttags_r.cursor
+        t = t + 1
+    let end_r = kafkaprim.read_tagged_fields(cur)!
+    let v = KafkaOffsetCommitResponse { throttle_time_ms: throttle, topics: topics }
+    Ok(KafkaBodyRead { response: KafkaOffsetCommitResp(v), cursor: end_r.cursor })
+
+fn encode_offset_commit_body(w: kafkaprim.KafkaWriter, version: Int,
+                             v: KafkaOffsetCommitResponse) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = w
+    if version >= 3
+        out = kafkaprim.write_int32(out, v.throttle_time_ms)
+    out = kafkaprim.write_array_len(out, list.len(v.topics))!
+    for t in v.topics
+        out = kafkaprim.write_str(out, t.name)!
+        out = kafkaprim.write_array_len(out, list.len(t.partitions))!
+        for p in t.partitions
+            out = kafkaprim.write_int32(out, p.index)
+            out = kafkaprim.write_int16(out, kafkaerror.error_code_number(p.error_code))
+            out = kafkaprim.write_tagged_fields(out, [])
+        out = kafkaprim.write_tagged_fields(out, [])
+    out = kafkaprim.write_tagged_fields(out, [])
+    Ok(out)
+
+// ── OffsetFetch ──────────────────────────────────────────────────────
+
+fn decode_offset_fetch_body(c: kafkaprim.KafkaCursor,
+                            version: Int) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    var throttle = 0
+    var cur = c
+    if version >= 3
+        let t_r = kafkaprim.read_int32(cur)!
+        throttle = t_r.value
+        cur = t_r.cursor
+    let topics_l = kafkaprim.read_array_len(cur)!
+    var topics: [KafkaOffsetFetchTopicResult] = []
+    cur = topics_l.cursor
+    var t = 0
+    while t < topics_l.count
+        let name_r = kafkaprim.read_required_str(cur, "topic name")!
+        let parts_l = kafkaprim.read_array_len(name_r.cursor)!
+        var parts: [KafkaOffsetFetchResult] = []
+        cur = parts_l.cursor
+        var i = 0
+        while i < parts_l.count
+            let idx_r = kafkaprim.read_int32(cur)!
+            let off_r = kafkaprim.read_int64(idx_r.cursor)!
+            // v5 added the leader epoch; `-1` is "no committed epoch",
+            // which is what a v1 to v4 reply means.
+            var epoch = -1
+            var after_off = off_r.cursor
+            if version >= 5
+                let ep_r = kafkaprim.read_int32(after_off)!
+                epoch = ep_r.value
+                after_off = ep_r.cursor
+            let meta_r = kafkaprim.read_str(after_off)!
+            let pcode_r = read_error_code(meta_r.cursor)!
+            let ptags_r = kafkaprim.read_tagged_fields(pcode_r.cursor)!
+            parts = list.push(parts, KafkaOffsetFetchResult { index: idx_r.value,
+                                                              committed_offset: off_r.value,
+                                                              committed_leader_epoch: epoch,
+                                                              metadata: meta_r.value,
+                                                              metadata_is_null: meta_r.is_null,
+                                                              error_code: pcode_r.code })
+            cur = ptags_r.cursor
+            i = i + 1
+        let ttags_r = kafkaprim.read_tagged_fields(cur)!
+        topics = list.push(topics, KafkaOffsetFetchTopicResult { name: name_r.value, partitions: parts })
+        cur = ttags_r.cursor
+        t = t + 1
+    // v2 added the top-level error code, and it comes after the topics.
+    var code = kafkaerror.KafkaErrNone
+    if version >= 2
+        let code_r = read_error_code(cur)!
+        code = code_r.code
+        cur = code_r.cursor
+    let end_r = kafkaprim.read_tagged_fields(cur)!
+    let v = KafkaOffsetFetchResponse { throttle_time_ms: throttle, topics: topics, error_code: code }
+    Ok(KafkaBodyRead { response: KafkaOffsetFetchResp(v), cursor: end_r.cursor })
+
+fn encode_offset_fetch_body(w: kafkaprim.KafkaWriter, version: Int,
+                            v: KafkaOffsetFetchResponse) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    var out = w
+    if version >= 3
+        out = kafkaprim.write_int32(out, v.throttle_time_ms)
+    out = kafkaprim.write_array_len(out, list.len(v.topics))!
+    for t in v.topics
+        out = kafkaprim.write_str(out, t.name)!
+        out = kafkaprim.write_array_len(out, list.len(t.partitions))!
+        for p in t.partitions
+            out = kafkaprim.write_int32(out, p.index)
+            out = kafkaprim.write_int64(out, p.committed_offset)
+            if version >= 5
+                out = kafkaprim.write_int32(out, p.committed_leader_epoch)
+            out = put_opt_str(out, p.metadata, p.metadata_is_null)!
+            out = kafkaprim.write_int16(out, kafkaerror.error_code_number(p.error_code))
+            out = kafkaprim.write_tagged_fields(out, [])
+        out = kafkaprim.write_tagged_fields(out, [])
+    if version >= 2
+        out = kafkaprim.write_int16(out, kafkaerror.error_code_number(v.error_code))
+    out = kafkaprim.write_tagged_fields(out, [])
+    Ok(out)
+
+// ── dispatch ─────────────────────────────────────────────────────────
+
+fn decode_body(c: kafkaprim.KafkaCursor, k: kafkaapi.KafkaApiKey, version: Int,
+               set: kafkarecords.KafkaCodecSet) -> Result<KafkaBodyRead, kafkaerror.KafkaFault>
+    match k
+        KafkaApiVersions     => decode_api_versions_body(c, version)
+        KafkaMetadata        => decode_metadata_body(c, version)
+        KafkaProduce         => decode_produce_body(c, version)
+        KafkaFetch           => decode_fetch_body(c, version, set)
+        KafkaListOffsets     => decode_list_offsets_body(c, version)
+        KafkaFindCoordinator => decode_find_coordinator_body(c, version)
+        KafkaJoinGroup       => decode_join_group_body(c, version)
+        KafkaSyncGroup       => decode_sync_group_body(c, version)
+        KafkaHeartbeat       => decode_heartbeat_body(c, version)
+        KafkaOffsetCommit    => decode_offset_commit_body(c, version)
+        KafkaOffsetFetch     => decode_offset_fetch_body(c, version)
+
+fn encode_body(w: kafkaprim.KafkaWriter, version: Int, r: KafkaResponse,
+               set: kafkarecords.KafkaCodecSet) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
+    match r
+        KafkaApiVersionsResp(v)     => encode_api_versions_body(w, version, v)
+        KafkaMetadataResp(v)        => encode_metadata_body(w, version, v)
+        KafkaProduceResp(v)         => encode_produce_body(w, version, v)
+        KafkaFetchResp(v)           => encode_fetch_body(w, version, v, set)
+        KafkaListOffsetsResp(v)     => encode_list_offsets_body(w, version, v)
+        KafkaFindCoordinatorResp(v) => encode_find_coordinator_body(w, version, v)
+        KafkaJoinGroupResp(v)       => encode_join_group_body(w, version, v)
+        KafkaSyncGroupResp(v)       => encode_sync_group_body(w, version, v)
+        KafkaHeartbeatResp(v)       => encode_heartbeat_body(w, version, v)
+        KafkaOffsetCommitResp(v)    => encode_offset_commit_body(w, version, v)
+        KafkaOffsetFetchResp(v)     => encode_offset_fetch_body(w, version, v)
+
+// Which errors a response carries, with where each came from.
+
+fn top_level_failure(c: kafkaerror.KafkaErrorCode) -> [KafkaResultError]
+    if kafkaerror.error_code_number(c) == 0
+        return []
+    [KafkaResultError { topic: "", partition: -1, code: c }]
+
+fn partition_failure(topic: Str, partition: Int, c: kafkaerror.KafkaErrorCode) -> [KafkaResultError]
+    if kafkaerror.error_code_number(c) == 0
+        return []
+    [KafkaResultError { topic: topic, partition: partition, code: c }]
+
+fn metadata_failures(v: KafkaMetadataResponse) -> [KafkaResultError]
+    var out: [KafkaResultError] = []
+    for t in v.topics
+        let own = partition_failure(t.name, -1, t.error_code)
+        out = list.concat(out, own)
+        for p in t.partitions
+            let one = partition_failure(t.name, p.index, p.error_code)
+            out = list.concat(out, one)
+    out
+
+fn produce_failures(v: KafkaProduceResponse) -> [KafkaResultError]
+    var out: [KafkaResultError] = []
+    for t in v.topics
+        for p in t.partitions
+            let one = partition_failure(t.name, p.index, p.error_code)
+            out = list.concat(out, one)
+    out
+
+fn fetch_failures(v: KafkaFetchResponse) -> [KafkaResultError]
+    var out: [KafkaResultError] = top_level_failure(v.error_code)
+    for t in v.topics
+        for p in t.partitions
+            let one = partition_failure(t.name, p.index, p.error_code)
+            out = list.concat(out, one)
+    out
+
+fn list_offsets_failures(v: KafkaListOffsetsResponse) -> [KafkaResultError]
+    var out: [KafkaResultError] = []
+    for t in v.topics
+        for p in t.partitions
+            let one = partition_failure(t.name, p.index, p.error_code)
+            out = list.concat(out, one)
+    out
+
+fn offset_commit_failures(v: KafkaOffsetCommitResponse) -> [KafkaResultError]
+    var out: [KafkaResultError] = []
+    for t in v.topics
+        for p in t.partitions
+            let one = partition_failure(t.name, p.index, p.error_code)
+            out = list.concat(out, one)
+    out
+
+fn offset_fetch_failures(v: KafkaOffsetFetchResponse) -> [KafkaResultError]
+    var out: [KafkaResultError] = top_level_failure(v.error_code)
+    for t in v.topics
+        for p in t.partitions
+            let one = partition_failure(t.name, p.index, p.error_code)
+            out = list.concat(out, one)
+    out
+
+fn fetch_watermark(v: KafkaFetchResponse, topic: Str, partition: Int) -> ?Int
+    for t in v.topics
+        if t.name == topic
+            for p in t.partitions
+                if p.index == partition
+                    return Some(p.high_watermark)
+    None
+
+fn fetch_batches(v: KafkaFetchResponse) -> [kafkarecords.KafkaRecordBatch]
+    v.topics |> list.flat_map(t => t.partitions |> list.flat_map(p => p.batches))
 
 // The reply to `ApiVersions`.
 //
@@ -331,11 +1284,35 @@ pub enum KafkaResponse
 // ```
 pub fn decode_response(buf: Bytes, k: kafkaapi.KafkaApiKey, version: Int,
                        set: kafkarecords.KafkaCodecSet) -> Result<KafkaResponse, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaresp.decode_response")
+    let unsupported = kafkaapi.check_version(k, version)
+    if let Some(f) = unsupported
+        return Err(f)
+    // The header comes first and its shape comes from the key and
+    // version, which is the one fact the bytes do not carry.
+    let c = kafkaprim.cursor(buf, kafkaapi.wire_style(k, version))
+    let head = kafkahdr.decode_response_header(c, k, version)!
+    let body = decode_body(head.cursor, k, version, set)!
+    // Whatever is left over is a version mismatch rather than
+    // corruption: the body decoded, and it was not the whole body.
+    if not kafkaprim.at_end(body.cursor)
+        return Err(kafkaerror.KafkaTrailingBytes(body.cursor.offset,
+                                                 kafkaprim.remaining(body.cursor)))
+    Ok(body.response)
 
 // Which API key a response is.
 pub fn response_api_key(r: KafkaResponse) -> kafkaapi.KafkaApiKey
-    todo("kafka-codec-nv.kafkaresp.response_api_key")
+    match r
+        KafkaApiVersionsResp(_)     => kafkaapi.KafkaApiVersions
+        KafkaMetadataResp(_)        => kafkaapi.KafkaMetadata
+        KafkaProduceResp(_)         => kafkaapi.KafkaProduce
+        KafkaFetchResp(_)           => kafkaapi.KafkaFetch
+        KafkaListOffsetsResp(_)     => kafkaapi.KafkaListOffsets
+        KafkaFindCoordinatorResp(_) => kafkaapi.KafkaFindCoordinator
+        KafkaJoinGroupResp(_)       => kafkaapi.KafkaJoinGroup
+        KafkaSyncGroupResp(_)       => kafkaapi.KafkaSyncGroup
+        KafkaHeartbeatResp(_)       => kafkaapi.KafkaHeartbeat
+        KafkaOffsetCommitResp(_)    => kafkaapi.KafkaOffsetCommit
+        KafkaOffsetFetchResp(_)     => kafkaapi.KafkaOffsetFetch
 
 // How long the broker delayed this response because the client
 // exceeded a quota, in milliseconds.
@@ -353,7 +1330,18 @@ pub fn response_api_key(r: KafkaResponse) -> kafkaapi.KafkaApiKey
 //     println("${kafkaresp.throttle_time_of(r)}")
 // ```
 pub fn throttle_time_of(r: KafkaResponse) -> Int
-    todo("kafka-codec-nv.kafkaresp.throttle_time_of")
+    match r
+        KafkaApiVersionsResp(v)     => v.throttle_time_ms
+        KafkaMetadataResp(v)        => v.throttle_time_ms
+        KafkaProduceResp(v)         => v.throttle_time_ms
+        KafkaFetchResp(v)           => v.throttle_time_ms
+        KafkaListOffsetsResp(v)     => v.throttle_time_ms
+        KafkaFindCoordinatorResp(v) => v.throttle_time_ms
+        KafkaJoinGroupResp(v)       => v.throttle_time_ms
+        KafkaSyncGroupResp(v)       => v.throttle_time_ms
+        KafkaHeartbeatResp(v)       => v.throttle_time_ms
+        KafkaOffsetCommitResp(v)    => v.throttle_time_ms
+        KafkaOffsetFetchResp(v)     => v.throttle_time_ms
 
 // The first non-`KafkaErrNone` code anywhere in a response, or `None`.
 //
@@ -373,7 +1361,10 @@ pub fn throttle_time_of(r: KafkaResponse) -> Int
 //         None    => println("every result succeeded")
 // ```
 pub fn first_error(r: KafkaResponse) -> ?kafkaerror.KafkaErrorCode
-    todo("kafka-codec-nv.kafkaresp.first_error")
+    let found = errors_of(r)
+    match list.first(found)
+        Some(e) => Some(e.code)
+        None    => None
 
 // Every non-`KafkaErrNone` code in a response, with the topic and
 // partition each came from.
@@ -382,7 +1373,18 @@ pub fn first_error(r: KafkaResponse) -> ?kafkaerror.KafkaErrorCode
 // partitions that half failed produces six entries here, and a client
 // retries exactly those six.
 pub fn errors_of(r: KafkaResponse) -> [KafkaResultError]
-    todo("kafka-codec-nv.kafkaresp.errors_of")
+    match r
+        KafkaApiVersionsResp(v)     => top_level_failure(v.error_code)
+        KafkaMetadataResp(v)        => metadata_failures(v)
+        KafkaProduceResp(v)         => produce_failures(v)
+        KafkaFetchResp(v)           => fetch_failures(v)
+        KafkaListOffsetsResp(v)     => list_offsets_failures(v)
+        KafkaFindCoordinatorResp(v) => top_level_failure(v.error_code)
+        KafkaJoinGroupResp(v)       => top_level_failure(v.error_code)
+        KafkaSyncGroupResp(v)       => top_level_failure(v.error_code)
+        KafkaHeartbeatResp(v)       => top_level_failure(v.error_code)
+        KafkaOffsetCommitResp(v)    => offset_commit_failures(v)
+        KafkaOffsetFetchResp(v)     => offset_fetch_failures(v)
 
 // One failed result, with where it came from.
 pub struct KafkaResultError
@@ -394,14 +1396,14 @@ pub struct KafkaResultError
 
 // Whether every result in a response succeeded.
 pub fn is_all_ok(r: KafkaResponse) -> Bool
-    todo("kafka-codec-nv.kafkaresp.is_all_ok")
+    list.len(errors_of(r)) == 0
 
 // A heartbeat reply with no throttle and no error.
 //
 // A constructor for a test double and for the doc examples above; a
 // real one comes from `decode_response`.
 pub fn empty_heartbeat_response() -> KafkaHeartbeatResponse
-    todo("kafka-codec-nv.kafkaresp.empty_heartbeat_response")
+    KafkaHeartbeatResponse { throttle_time_ms: 0, error_code: kafkaerror.KafkaErrNone }
 
 // Write a response back to bytes, at a key and version.
 //
@@ -422,7 +1424,17 @@ pub fn empty_heartbeat_response() -> KafkaHeartbeatResponse
 // ```
 pub fn encode_response(r: KafkaResponse, version: Int, correlation_id: Int,
                        set: kafkarecords.KafkaCodecSet) -> Result<Bytes, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaresp.encode_response")
+    let k = response_api_key(r)
+    let unsupported = kafkaapi.check_version(k, version)
+    if let Some(f) = unsupported
+        return Err(f)
+    // The header's shape comes from the key and version exactly as it
+    // does for a decode, including the `ApiVersions` exception — which
+    // is what makes a test double's bytes parseable by a real client.
+    let w = kafkaprim.writer(kafkaapi.wire_style(k, version))
+    let head = kafkahdr.encode_response_header(w, kafkahdr.response_header(correlation_id), k, version)!
+    let body = encode_body(head, version, r, set)!
+    Ok(kafkaprim.finish(body))
 
 // The high watermark of one partition in a fetch response, or `None`.
 //
@@ -441,7 +1453,9 @@ pub fn encode_response(r: KafkaResponse, version: Int, correlation_id: Int,
 //         None    => println("not a fetch response for that partition")
 // ```
 pub fn high_watermark_of(r: KafkaResponse, topic: Str, partition: Int) -> ?Int
-    todo("kafka-codec-nv.kafkaresp.high_watermark_of")
+    match r
+        KafkaFetchResp(v) => fetch_watermark(v, topic, partition)
+        _                 => None
 
 // Every record batch a fetch response carries, flattened across topics
 // and partitions.
@@ -450,4 +1464,6 @@ pub fn high_watermark_of(r: KafkaResponse, topic: Str, partition: Int) -> ?Int
 // records without the two loops.  A consumer reading several
 // partitions walks the results, because it must commit per partition.
 pub fn all_batches(r: KafkaResponse) -> [kafkarecords.KafkaRecordBatch]
-    todo("kafka-codec-nv.kafkaresp.all_batches")
+    match r
+        KafkaFetchResp(v) => fetch_batches(v)
+        _                 => []

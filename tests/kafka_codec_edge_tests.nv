@@ -1,0 +1,815 @@
+// kafka_codec_edge_tests.nv — the edges the API suites state a design
+// for but do not reach, and the two traps a Kafka codec gets silently
+// wrong.
+//
+// The five API suites are the published oracle and are not edited.
+// What is pinned here is what they leave open:
+//
+//   * the three spellings of a length.  A classic `int16` or `int32`
+//     length says null with `-1` and is MALFORMED for anything below
+//     it — read as unsigned, `-2` is a sixty-five-kilobyte string, and
+//     a decoder that believed it answers a wrong length instead of
+//     refusing.  A compact varint says null with `0` and holds the
+//     length plus one, so it cannot express `-1` at all and an empty
+//     string costs a byte where a null costs a different one.
+//   * the byte range a record batch's CRC-32C covers: everything after
+//     the checksum field, compressed records included, and NOT the
+//     batch's own header.  The oracle asserts that the checksum and the
+//     verifier agree, which a wrong range shared by both would still
+//     pass; here the range is pinned against CRC-32C computed in the
+//     test from the standard check value.
+//   * the header version a message is read at, which is the message
+//     version's question only by coincidence: a flexible message gets a
+//     header with a tagged-field section, and an `ApiVersions` reply is
+//     header v0 at every version including its flexible ones.
+//   * the frame states an exchange reaches, and one whole send, feed,
+//     drain cycle.
+//   * the arms the suites never run because their values never take that
+//     side: a broker floor above this package's, the versions the three
+//     entry points refuse, a Produce v8 reply's per-record errors, the
+//     null a fetch reply writes for a partition with nothing to send,
+//     and the record-length varints a record's own fields carry.
+
+use std.test
+use crc
+use kafkaapi
+use kafkaerror
+use kafkahdr
+use kafkaframe
+use kafkaprim
+use kafkarecords
+use kafkareq
+use kafkaresp
+
+// A classic length field holding `n`, read back as a signed `int16`.
+fn a_classic_int16(n: Int) -> Bytes
+    bytes.u16_be(n)
+
+// A classic length field holding `n`, read back as a signed `int32`.
+fn a_classic_int32(n: Int) -> Bytes
+    bytes.u32_be(n)
+
+// One compact varint count, which is what the flexible spelling puts
+// where the classic one puts the length.
+fn a_compact_count(n: Int) -> Bytes
+    bytes.u8(n)
+
+// A heartbeat request, which is the shortest one this package encodes
+// at a version every broker speaks.
+fn a_heartbeat() -> kafkareq.KafkaRequest
+    KafkaHeartbeatReq(kafkareq.heartbeat_request("edge-group", 1, "edge-member"))
+
+// The bytes a string writes to, and an empty buffer if it refuses —
+// which the lengths asserted on either side of it would catch.
+fn str_wire(style: kafkaprim.KafkaWireStyle, text: Str) -> Bytes
+    match kafkaprim.write_str(kafkaprim.writer(style), text)
+        Ok(w)  => kafkaprim.finish(w)
+        Err(_) => bytes.zeros(0)
+
+// The bytes a response header writes to, the same way.
+fn header_wire(k: kafkaapi.KafkaApiKey, version: Int) -> Bytes
+    match kafkahdr.encode_response_header(kafkaprim.writer(kafkaapi.wire_style(k, version)),
+                                          kafkahdr.response_header(7), k, version)
+        Ok(w)  => kafkaprim.finish(w)
+        Err(_) => bytes.zeros(0)
+
+@test
+fn test_a_classic_length_of_minus_one_is_null_and_one_below_it_is_malformed() [io]
+    // The classic spelling is a SIGNED length.  `-1` is the protocol's
+    // null and any other negative is malformed; a decoder that read the
+    // field unsigned would see 65534 as a sixty-five-kilobyte string,
+    // report a truncation, and never say which field was wrong.
+    test.case("a classic -1 is the null the protocol allows")
+    match kafkaprim.read_str(kafkaprim.cursor(a_classic_int16(65535), KafkaClassic))
+        Ok(r)  =>
+            test.assert(r.is_null)
+            test.assert_eq(str.len(r.value), 0)
+        Err(_) =>
+            test.fail("a classic -1 is the null the protocol allows")
+
+    test.case("a classic 0 is an empty string, which is the other answer")
+    match kafkaprim.read_str(kafkaprim.cursor(a_classic_int16(0), KafkaClassic))
+        Ok(r)  =>
+            test.assert(not r.is_null)
+            test.assert_eq(str.len(r.value), 0)
+        Err(_) =>
+            test.fail("a classic 0 is an empty string")
+
+    test.case("and a classic -2 is malformed, refused as the null it may not be")
+    match kafkaprim.read_str(kafkaprim.cursor(a_classic_int16(65534), KafkaClassic))
+        Ok(_)  => test.fail("a classic length of -2 is not a length")
+        Err(f) =>
+            match f
+                KafkaNullNotAllowed(_, _) => test.assert(true)
+                _                         => test.fail("a classic -2 is a null that is not allowed")
+
+    test.case("the same rule holds for a byte string's four-byte length")
+    match kafkaprim.read_bytes(kafkaprim.cursor(a_classic_int32(4294967295), KafkaClassic))
+        Ok(r)  => test.assert(r.is_null)
+        Err(_) => test.fail("a classic -1 bytes field is null")
+    match kafkaprim.read_bytes(kafkaprim.cursor(a_classic_int32(4294967294), KafkaClassic))
+        Ok(_)  => test.fail("a classic -2 bytes field is not a length")
+        Err(f) =>
+            match f
+                KafkaNullNotAllowed(_, _) => test.assert(true)
+                _                         => test.fail("a classic -2 bytes field is a null that is not allowed")
+
+    test.case("and for an array's count, where null means every topic and 0 means none")
+    match kafkaprim.read_array_len(kafkaprim.cursor(a_classic_int32(4294967295), KafkaClassic))
+        Ok(r)  =>
+            test.assert(r.is_null)
+            test.assert_eq(r.count, 0)
+        Err(_) =>
+            test.fail("a classic -1 array count is a null array")
+    match kafkaprim.read_array_len(kafkaprim.cursor(a_classic_int32(4294967294), KafkaClassic))
+        Ok(_)  => test.fail("a classic -2 array count is not a count")
+        Err(f) =>
+            match f
+                KafkaNullNotAllowed(_, _) => test.assert(true)
+                _                         => test.fail("a classic -2 array count is a null that is not allowed")
+
+@test
+fn test_the_compact_spelling_says_null_with_zero_and_holds_the_length_plus_one() [io]
+    // There is no compact `-1`: the length is an unsigned varint, so
+    // the malformed-negative case the classic spelling has to refuse
+    // does not exist here.  What does exist is the off-by-one: an empty
+    // string is `1`, not `0`, and a decoder that read the varint as the
+    // length would answer every string one byte short — including a
+    // null one, which it would answer as empty.
+    test.case("a compact 0 is null")
+    match kafkaprim.read_str(kafkaprim.cursor(a_compact_count(0), KafkaFlexible))
+        Ok(r)  =>
+            test.assert(r.is_null)
+            test.assert_eq(str.len(r.value), 0)
+        Err(_) =>
+            test.fail("a compact 0 is the null the protocol allows")
+
+    test.case("a compact 1 is an empty string")
+    match kafkaprim.read_str(kafkaprim.cursor(a_compact_count(1), KafkaFlexible))
+        Ok(r)  =>
+            test.assert(not r.is_null)
+            test.assert_eq(str.len(r.value), 0)
+        Err(_) =>
+            test.fail("a compact 1 is an empty string")
+
+    test.case("a compact 3 carries two bytes of text")
+    let two = bytes.concat([a_compact_count(3), bytes.from_str("ab")])
+    match kafkaprim.read_str(kafkaprim.cursor(two, KafkaFlexible))
+        Ok(r)  =>
+            test.assert(not r.is_null)
+            test.assert_eq_str(r.value, "ab")
+            test.assert_eq(r.cursor.offset, 3)
+        Err(_) =>
+            test.fail("a compact 3 is a two-byte string")
+
+    test.case("the writer spells the null one and the empty one differently")
+    let null_wire = kafkaprim.finish(kafkaprim.write_null_str(kafkaprim.writer(KafkaFlexible)))
+    let empty_wire = str_wire(KafkaFlexible, "")
+    test.assert_eq(bytes.len(null_wire), 1)
+    test.assert_eq(bytes.len(empty_wire), 1)
+    test.assert_ne(bytes.to_hex(null_wire), bytes.to_hex(empty_wire))
+
+    test.case("and the classic spelling spends two bytes on each of the same two")
+    let classic_null = kafkaprim.finish(kafkaprim.write_null_str(kafkaprim.writer(KafkaClassic)))
+    let classic_empty = str_wire(KafkaClassic, "")
+    test.assert_eq(bytes.len(classic_null), 2)
+    test.assert_eq(bytes.len(classic_empty), 2)
+    test.assert_ne(bytes.to_hex(classic_null), bytes.to_hex(classic_empty))
+
+@test
+fn test_the_checksum_covers_everything_after_its_own_field_and_nothing_before_it() [io]
+    test.case("CRC-32C is the Castagnoli polynomial, whose check value is 3808858755")
+    // The one number that distinguishes CRC-32C from the CRC-32 zip and
+    // PNG use.  A batch checksummed with the other polynomial is one
+    // every broker refuses.
+    test.assert_eq(crc.crc32c().checksum(bytes.from_str("123456789")), 3808858755)
+
+    let set = kafkarecords.no_codecs()
+    let record = kafkarecords.record(bytes.from_str("k"), bytes.from_str("value"))
+    let built = kafkarecords.append(kafkarecords.batch(0, 1789000000000), record)
+
+    test.case("an encoded v2 batch is a header, a checksum at 17 and a body")
+    let raw = match kafkarecords.encode_batch(built, set)
+        Ok(b)  => b
+        Err(_) =>
+            return
+    test.assert(bytes.len(raw) > 21)
+
+    test.case("the stored checksum is the CRC of byte 21 to the end of the batch")
+    // base_offset(8) batch_length(4) leader_epoch(4) magic(1) crc(4):
+    // the checksum sits at 17 and covers from 21 to the batch's end,
+    // which the declared length bounds — compressed records included.
+    // The oracle asserts that the checksum and the verifier agree,
+    // which the same wrong range in both would still pass; this is
+    // CRC-32C computed here, over a range written out by hand.
+    let stored = bytes.u32_be_at(raw, 17) ?? -1
+    test.assert_eq(stored, crc.crc32c().checksum(bytes.slice(raw, 21, bytes.len(raw))))
+
+    test.case("it is not the checksum of the whole batch, which including the field would give")
+    test.assert_ne(stored, crc.crc32c().checksum(raw))
+
+    test.case("nor of the bytes from the checksum field on, which a four-byte slip would give")
+    test.assert_ne(stored, crc.crc32c().checksum(bytes.slice(raw, 17, bytes.len(raw))))
+
+    test.case("and the package's own reader names the same range")
+    match kafkarecords.batch_crc(raw)
+        Ok(v)  => test.assert_eq(v, crc.crc32c().checksum(bytes.slice(raw, 21, bytes.len(raw))))
+        Err(_) => test.fail("a whole batch has a computable CRC")
+
+    test.case("a batch with a cheated checksum is refused with both numbers")
+    var tampered = bytes.clone(raw)
+    tampered = bytes.set_u32_be(tampered, 17, 0)
+    match kafkarecords.verify_crc(tampered)
+        Ok(_)  => test.fail("a batch whose checksum field is zero does not verify")
+        Err(f) =>
+            match f
+                KafkaBadCrc(_, _) => test.assert(true)
+                _                 => test.fail("a checksum mismatch is KafkaBadCrc")
+
+@test
+fn test_a_headers_version_is_its_own_question_and_the_message_version_only_hints() [io]
+    test.case("a classic message has a v1 request header and a v0 response one")
+    test.assert_eq(kafkaapi.header_request_version(KafkaMetadata, 8), 1)
+    test.assert_eq(kafkaapi.header_response_version(KafkaMetadata, 8), 0)
+
+    test.case("a flexible one has a v2 request header and a v1 response one")
+    test.assert_eq(kafkaapi.header_request_version(KafkaMetadata, 9), 2)
+    test.assert_eq(kafkaapi.header_response_version(KafkaMetadata, 9), 1)
+
+    test.case("which is the message's own spelling, not the header's")
+    match kafkaapi.wire_style(KafkaMetadata, 9)
+        KafkaFlexible => test.assert(true)
+        KafkaClassic  => test.fail("a v9 Metadata request is written flexibly")
+
+    test.case("so a v2 header is read with its tagged-field count and a v1 one without")
+    // The same key, the same client id, one version apart: the reader
+    // has to work out which from the version, because nothing in the
+    // bytes says.  The trailing zero is the tagged-field count a v1
+    // reader would leave behind as a body byte.
+    let v2 = bytes.concat([bytes.u16_be(3), bytes.u16_be(9), bytes.u32_be(7),
+                           a_compact_count(3), bytes.from_str("nv"), bytes.u8(0)])
+    match kafkahdr.decode_request_header(kafkaprim.cursor(v2, KafkaClassic))
+        Ok(r)  =>
+            test.assert_eq(r.header.version, 9)
+            test.assert_eq(r.header.correlation_id, 7)
+            test.assert_eq_str(r.header.client_id, "nv")
+            test.assert_eq(r.cursor.offset, bytes.len(v2))
+        Err(_) =>
+            test.fail("a v2 request header decodes")
+
+    let v1 = bytes.concat([bytes.u16_be(3), bytes.u16_be(8), bytes.u32_be(7),
+                           a_classic_int16(2), bytes.from_str("nv")])
+    match kafkahdr.decode_request_header(kafkaprim.cursor(v1, KafkaClassic))
+        Ok(r)  =>
+            test.assert_eq(r.header.version, 8)
+            test.assert_eq_str(r.header.client_id, "nv")
+            test.assert_eq(r.cursor.offset, bytes.len(v1))
+        Err(_) =>
+            test.fail("a v1 request header decodes")
+
+@test
+fn test_an_api_versions_reply_carries_a_v0_header_at_every_version() [io]
+    // The exception the whole package has to know: a client sends
+    // `ApiVersions` before it knows what the broker speaks, so that
+    // reply's header cannot depend on the answer.  A decoder that
+    // applied the general rule reads the tagged-field count that is not
+    // there and every field after it is wrong.
+    test.case("ApiVersions is flexible from v3 and its response header is still v0")
+    test.assert_eq(kafkaapi.flexible_from(KafkaApiVersions), 3)
+    test.assert(kafkaapi.is_flexible(KafkaApiVersions, 3))
+    test.assert_eq(kafkaapi.header_response_version(KafkaApiVersions, 3), 0)
+    test.assert_eq(kafkaapi.header_response_version(KafkaApiVersions, 4), 0)
+
+    test.case("so the same correlation id costs four bytes in one reply and five in the other")
+    let from_versions = header_wire(KafkaApiVersions, 3)
+    let from_metadata = header_wire(KafkaMetadata, 9)
+    test.assert_eq(bytes.len(from_versions), 4)
+    test.assert_eq(bytes.len(from_metadata), 5)
+
+    test.case("and reading one leaves the cursor on the body's first field")
+    let reply = bytes.concat([bytes.u32_be(7), bytes.u16_be(0), bytes.u32_be(1)])
+    match kafkahdr.decode_response_header(kafkaprim.cursor(reply, KafkaFlexible),
+                                          KafkaApiVersions, 3)
+        Ok(r)  =>
+            test.assert_eq(r.header.correlation_id, 7)
+            test.assert_eq(r.cursor.offset, 4)
+        Err(_) =>
+            test.fail("an ApiVersions v3 response header is a correlation id and nothing else")
+
+    test.case("where a flexible Metadata reply's header does carry one")
+    let metadata_reply = bytes.concat([bytes.u32_be(7), bytes.u8(0), bytes.u32_be(1)])
+    match kafkahdr.decode_response_header(kafkaprim.cursor(metadata_reply, KafkaFlexible),
+                                          KafkaMetadata, 9)
+        Ok(r)  =>
+            test.assert_eq(r.cursor.offset, 5)
+        Err(_) =>
+            test.fail("a Metadata v9 response header ends in a tagged-field section")
+
+@test
+fn test_the_frame_length_answers_before_the_body_is_believed() [io]
+    test.case("a buffer with fewer than four bytes holds no length yet")
+    match kafkaframe.frame_length(bytes.zeros(2), 0, 104857600)
+        Ok(maybe) =>
+            match maybe
+                None    => test.assert(true)
+                Some(_) => test.fail("two bytes cannot say how long a frame is")
+        Err(_)    =>
+            test.fail("a short buffer is not an error")
+
+    test.case("a declared length past the caller's ceiling is refused with both numbers")
+    let over = bytes.concat([bytes.u32_be(1000), bytes.zeros(4)])
+    match kafkaframe.frame_length(over, 0, 100)
+        Ok(_)  => test.fail("a thousand-byte frame past a hundred-byte ceiling is refused")
+        Err(f) =>
+            match f
+                KafkaFrameTooLarge(declared, limit) =>
+                    test.assert_eq(declared, 1000)
+                    test.assert_eq(limit, 100)
+                _                                   =>
+                    test.fail("a length past the ceiling is KafkaFrameTooLarge")
+
+    test.case("a length with the high bit set is refused even with no ceiling at all")
+    // The field is an `int32` on the wire: 4294967295 is -1, which is
+    // not a size, and a caller with no ceiling of its own must still
+    // not be handed one.
+    let hostile = bytes.concat([bytes.u32_be(4294967295), bytes.zeros(4)])
+    match kafkaframe.frame_length(hostile, 0, 0)
+        Ok(_)  => test.fail("a negative int32 length is not a size")
+        Err(_) => test.assert(true)
+
+    test.case("while a ceiling of 0 believes any length an int32 can hold")
+    match kafkaframe.frame_length(over, 0, 0)
+        Ok(maybe) =>
+            match maybe
+                Some(total) => test.assert_eq(total, 1004)
+                None        => test.fail("eight bytes hold a declared length")
+        Err(_)    =>
+            test.fail("with no ceiling the length is believed")
+
+    test.case("unframe refuses a body shorter than the shortest Kafka message")
+    match kafkaframe.unframe(bytes.zeros(4), 0, 104857600)
+        Ok(_)  => test.fail("a zero-byte body is not a message")
+        Err(_) => test.assert(true)
+
+    test.case("and refuses a length the buffer does not hold")
+    let short = bytes.concat([bytes.u32_be(40), bytes.zeros(4)])
+    match kafkaframe.unframe(short, 0, 104857600)
+        Ok(_)  => test.fail("a forty-byte body is not in an eight-byte buffer")
+        Err(_) => test.assert(true)
+
+    test.case("a whole frame answers its body, and the length counts itself out")
+    let body = bytes.from_str("body")
+    let whole = kafkaframe.frame(body)
+    test.assert_eq(bytes.len(whole), 8)
+    match kafkaframe.frame_length(whole, 0, 104857600)
+        Ok(maybe) =>
+            match maybe
+                Some(total) => test.assert_eq(total, 8)
+                None        => test.fail("a whole frame has a length")
+        Err(_)    =>
+            test.fail("a whole frame is under any ceiling")
+    match kafkaframe.unframe(whole, 0, 104857600)
+        Ok(b)  => test.assert_eq_str(bytes.to_str(b), "body")
+        Err(_) => test.fail("a frame this package built comes back apart")
+
+@test
+fn test_a_request_sent_and_a_reply_fed_come_back_out_of_drain() [io]
+    let set = kafkarecords.no_codecs()
+    let sent = match kafkaframe.send(kafkaframe.exchange("edge-suite"), a_heartbeat(), set)
+        Ok(s)  => s
+        Err(_) =>
+            return
+
+    test.case("a request that expects an answer is remembered")
+    test.assert(sent.expects_response)
+    test.assert_eq(kafkaframe.pending_count(sent.exchange), 1)
+    test.assert_eq(list.len(kafkaframe.pending_requests(sent.exchange)), 1)
+    test.assert_eq(kafkaframe.buffered(sent.exchange), 0)
+
+    test.case("and its reply decodes at the version it was sent at")
+    let version = kafkaframe.version_for(sent.exchange, KafkaHeartbeat)
+    let reply = match kafkaresp.encode_response(
+        KafkaHeartbeatResp(kafkaresp.empty_heartbeat_response()), version,
+        sent.correlation_id, set)
+        Ok(b)  => b
+        Err(_) =>
+            return
+    let fed = kafkaframe.feed(sent.exchange, kafkaframe.frame(reply))
+    test.assert_eq(kafkaframe.buffered(fed), bytes.len(reply) + 4)
+
+    match kafkaframe.drain(fed, set)
+        Ok(d)  =>
+            test.assert_eq(list.len(d.answers), 1)
+            test.assert_eq(kafkaframe.pending_count(d.exchange), 0)
+            test.assert_eq(kafkaframe.buffered(d.exchange), 0)
+        Err(_) =>
+            test.fail("a reply this package encoded must decode")
+
+    test.case("a reply that answers no request is a correlation mismatch, not a decode")
+    let stray = kafkaframe.feed(kafkaframe.exchange("edge-suite"),
+                                kafkaframe.frame(bytes.u32_be(99)))
+    match kafkaframe.drain(stray, set)
+        Ok(_)  => test.fail("a reply that answers nothing is not decodable")
+        Err(f) =>
+            match f
+                KafkaCorrelationMismatch(got) => test.assert_eq(got, 99)
+                _                             => test.fail("a reply that answers nothing is a correlation mismatch")
+
+    test.case("and neither is one that answers the wrong request")
+    let second = match kafkaframe.send(kafkaframe.exchange("edge-suite"), a_heartbeat(), set)
+        Ok(s)  => s
+        Err(_) =>
+            return
+    let wrong_version = kafkaframe.version_for(second.exchange, KafkaHeartbeat)
+    let wrong = match kafkaresp.encode_response(
+        KafkaHeartbeatResp(kafkaresp.empty_heartbeat_response()), wrong_version, 77, set)
+        Ok(b)  => b
+        Err(_) =>
+            return
+    match kafkaframe.drain(kafkaframe.feed(second.exchange, kafkaframe.frame(wrong)), set)
+        Ok(_)  => test.fail("a reply for correlation id 77 does not answer id 1")
+        Err(f) =>
+            match f
+                KafkaCorrelationMismatch(got) => test.assert_eq(got, 77)
+                _                             => test.fail("a reply to the wrong request is a correlation mismatch")
+
+@test
+fn test_a_reset_hands_back_what_was_in_flight_and_keeps_the_broker_facts() [io]
+    let set = kafkarecords.no_codecs()
+    let sent = match kafkaframe.send(kafkaframe.exchange("edge-suite"), a_heartbeat(), set)
+        Ok(s)  => s
+        Err(_) =>
+            return
+    let only_metadata = KafkaApiSupport { key: 3, min_version: 9, max_version: 9 }
+    let learned = kafkaframe.with_versions(sent.exchange, [only_metadata])
+    let lost = kafkaframe.reset(learned)
+
+    test.case("the requests that will never be answered come back")
+    test.assert_eq(list.len(lost.abandoned), 1)
+    test.assert_eq(lost.abandoned[0].correlation_id, sent.correlation_id)
+
+    test.case("and the connection state that is about the broker survives")
+    test.assert_eq_str(lost.exchange.client_id, "edge-suite")
+    test.assert_eq(list.len(lost.exchange.versions), 1)
+    test.assert_eq(kafkaframe.pending_count(lost.exchange), 0)
+    test.assert_eq(kafkaframe.buffered(lost.exchange), 0)
+    test.assert_eq(kafkaframe.version_for(lost.exchange, KafkaMetadata), 9)
+
+    test.case("while what is about the socket does not")
+    let fed = kafkaframe.feed(learned, bytes.zeros(4))
+    test.assert_eq(kafkaframe.buffered(fed), 4)
+    test.assert_eq(kafkaframe.buffered(kafkaframe.reset(fed).exchange), 0)
+
+// ── the lines the suites leave unexecuted ────────────────────────────
+//
+// Each of these is a line the five API suites never run because their
+// values never take that side: a broker whose floor is above this
+// package's, the versions the three entry points refuse, a Produce
+// reply's per-record errors, the null a fetch reply writes for a
+// partition with nothing to send, and the two malformed record fields.
+// All of them are reachable through the public API, and a marker on a
+// reachable line says less than a verdict does.
+
+// A Produce reply at v9, the flexible spelling, with one topic, one
+// partition and ONE PER-RECORD ERROR — the field v8 added, which
+// `kafkaresp.encode_produce_body` cannot build because it writes the
+// empty list a broker sends for a batch it accepted.  Hand-built with
+// the package's own writers, so the spellings are the package's: a
+// compact array count is the count plus one and a compact string its
+// length plus one.
+fn a_produce_reply_with_a_rejected_record(correlation: Int) -> Bytes
+    var w = kafkaprim.writer(kafkaapi.wire_style(KafkaProduce, 9))
+    w = kafkahdr.encode_response_header(w, kafkahdr.response_header(correlation),
+                                        KafkaProduce, 9)!
+    w = kafkaprim.write_uvarint(w, 2)   // one topic
+    w = kafkaprim.write_str(w, "orders")!
+    w = kafkaprim.write_uvarint(w, 2)   // one partition
+    w = kafkaprim.write_int32(w, 0)   // index
+    w = kafkaprim.write_int16(w, 0)   // error code: none
+    w = kafkaprim.write_int64(w, 7)   // base offset
+    w = kafkaprim.write_int64(w, -1)   // log append time
+    w = kafkaprim.write_int64(w, 3)   // log start offset
+    w = kafkaprim.write_uvarint(w, 2)   // one per-record error
+    w = kafkaprim.write_int32(w, 0)   // its batch index
+    w = kafkaprim.write_str(w, "batch rejected")!
+    w = kafkaprim.write_tagged_fields(w, [])   // the error's own tags
+    w = kafkaprim.write_null_str(w)   // the partition's message
+    w = kafkaprim.write_tagged_fields(w, [])   // the partition's tags
+    w = kafkaprim.write_tagged_fields(w, [])   // the topic's tags
+    w = kafkaprim.write_int32(w, 100)   // throttle: AFTER the results
+    w = kafkaprim.write_tagged_fields(w, [])   // the body's tags
+    kafkaprim.finish(w)
+
+// A partition with nothing to send: an empty batch list, which a broker
+// sends as a null record set.
+fn a_fetch_reply_with_nothing_to_send() -> KafkaFetchResponse
+    KafkaFetchResponse { throttle_time_ms: 0, error_code: kafkaerror.KafkaErrNone,
+                         session_id: 0,
+                         topics: [KafkaFetchTopicResult { name: "orders",
+                                                          partitions: [KafkaFetchResult { index: 0,
+                                                                                          error_code: kafkaerror.KafkaErrNone,
+                                                                                          high_watermark: 41,
+                                                                                          last_stable_offset: 41,
+                                                                                          log_start_offset: 0,
+                                                                                          aborted_transactions: [],
+                                                                                          preferred_read_replica: -1,
+                                                                                          batches: [] }] }] }
+
+// A v2 batch with a hand-built record blob: the header
+// `kafkarecords.encode_batch` writes, with the checksum its own
+// `batch_crc` computes.  Offset `17` is the checksum field — the base
+// offset (`8`), the batch length (`4`), the leader epoch (`4`) and the
+// magic (`1`).
+fn a_hand_built_batch(blob: Bytes) -> Bytes
+    var w = kafkaprim.writer(kafkaprim.KafkaClassic)
+    w = kafkaprim.write_int64(w, 0)   // base offset
+    w = kafkaprim.write_int32(w, 49 + bytes.len(blob))   // batch length
+    w = kafkaprim.write_int32(w, 0)   // leader epoch
+    w = kafkaprim.write_int8(w, 2)   // magic: v2
+    w = kafkaprim.write_uint32(w, 0)   // checksum, written over
+    w = kafkaprim.write_int16(w, 0)   // attributes: no codec
+    w = kafkaprim.write_int32(w, 0)   // last offset delta
+    w = kafkaprim.write_int64(w, 0)   // base timestamp
+    w = kafkaprim.write_int64(w, 0)   // max timestamp
+    w = kafkaprim.write_int64(w, -1)   // producer id
+    w = kafkaprim.write_int16(w, -1)   // producer epoch
+    w = kafkaprim.write_int32(w, -1)   // base sequence
+    w = kafkaprim.write_int32(w, 1)   // one record
+    w = kafkaprim.write_raw(w, blob)
+    var out = kafkaprim.finish(w)
+    let sum = kafkarecords.batch_crc(out)!
+    bytes.set_u32_be(out, 17, sum)
+
+// One record whose key length is the varint the caller chooses.  A
+// record's own lengths are zigzag varints whatever the message's wire
+// style is, so `-1` is a null key and `-2` is malformed.
+fn a_record_with_key_length(n: Int) -> Bytes
+    var w = kafkaprim.writer(kafkaprim.KafkaClassic)
+    w = kafkaprim.write_varint(w, 7)   // the record's own length
+    w = kafkaprim.write_int8(w, 0)   // attributes
+    w = kafkaprim.write_varlong(w, 0)   // timestamp delta
+    w = kafkaprim.write_varint(w, 0)   // offset delta
+    w = kafkaprim.write_varint(w, n)   // the key's length
+    w = kafkaprim.write_varint(w, 1)   // the value's length
+    w = kafkaprim.write_raw(w, bytes.from_str("v"))
+    w = kafkaprim.write_varint(w, 0)   // header count
+    kafkaprim.finish(w)
+
+// Where a null key is legal and a null record length is not: the same
+// record with nothing but a null where its length belongs.
+fn a_record_of_null_length() -> Bytes
+    kafkaprim.finish(kafkaprim.write_varint(kafkaprim.writer(kafkaprim.KafkaClassic), -1))
+
+// A null byte string in one spelling, for the two lengths pinned below.
+fn null_bytes_wire(style: kafkaprim.KafkaWireStyle) -> Bytes
+    kafkaprim.finish(kafkaprim.write_null_bytes(kafkaprim.writer(style)))
+
+// A fetch request over one partition, with or without a topic the
+// client is telling the broker to forget.
+fn a_fetch_with(partitions_here: [KafkaFetchPartition],
+                forgotten: [KafkaFetchTopic]) -> KafkaFetchRequest
+    KafkaFetchRequest { replica_id: -1, max_wait_ms: 500, min_bytes: 1, max_bytes: 1048576,
+                        isolation_level: 0, session_id: 0, session_epoch: -1,
+                        topics: [KafkaFetchTopic { name: "orders", partitions: partitions_here }],
+                        forgotten_topics: forgotten, rack_id: "" }
+
+// The bytes a fetch request writes to at a version, for the length
+// comparison below.
+fn fetch_wire(v: KafkaFetchRequest, version: Int) -> Bytes
+    let h = kafkahdr.request_header(KafkaFetch, version, 6, "edge-client")
+    match kafkareq.encode_request(h, KafkaFetchReq(v), kafkarecords.no_codecs())
+        Ok(raw) => raw
+        Err(_)  => bytes.zeros(0)
+
+// The bytes a request header writes to at a message version, for the
+// two client-id lengths pinned below.
+fn request_header_wire(h: kafkahdr.KafkaRequestHeader, version: Int) -> Bytes
+    let w = kafkaprim.writer(kafkaapi.wire_style(KafkaApiVersions, version))
+    match kafkahdr.encode_request_header(w, h)
+        Ok(w2) => kafkaprim.finish(w2)
+        Err(_) => bytes.zeros(0)
+
+@test
+fn test_the_null_byte_string_has_a_spelling_per_wire_style() [io]
+    // `kafkaprim.write_null_bytes`'s flexible arm is unreachable from
+    // `kafkaresp.write_record_set`, whose writers are only ever classic
+    // — a Fetch reply at v12 or above would use it and this package's
+    // Fetch stops at v11 — so the two spellings are pinned here.
+    test.case("a classic null byte string is the four-byte -1")
+    let classic = null_bytes_wire(kafkaprim.KafkaClassic)
+    test.assert_eq(bytes.len(classic), 4)
+
+    test.case("and the compact one is a single zero byte")
+    let flexible = null_bytes_wire(kafkaprim.KafkaFlexible)
+    test.assert_eq(bytes.len(flexible), 1)
+    let read = kafkaprim.read_bytes(kafkaprim.cursor(flexible, kafkaprim.KafkaFlexible))!
+    test.assert(read.is_null)
+    test.assert_eq(bytes.len(read.value), 0)
+
+@test
+fn test_a_buffer_that_has_not_said_how_long_it_is_answers_truncated() [io]
+    // `unframe` refuses what `frame_length` leaves `None`: fewer than
+    // the four length bytes.  On a socket that is "read more", which is
+    // the field name the fault carries.
+    match kafkaframe.unframe(bytes.zeros(3), 0, 1048576)
+        Ok(_)  => test.fail("three bytes are not a frame")
+        Err(f) => test.assert_eq_str(kafkaerror.fault_code(f), "truncated")
+
+@test
+fn test_a_records_own_lengths_are_varints_where_null_is_legal_once() [io]
+    let set = kafkarecords.no_codecs()
+
+    test.case("a key length of -1 is the null a tombstone is made of")
+    match kafkarecords.decode_batch(a_hand_built_batch(a_record_with_key_length(-1)), 0, set)
+        Ok(r)  =>
+            test.assert_eq(list.len(r.batch.records), 1)
+            test.assert(r.batch.records[0].key_is_null)
+            test.assert_eq_str(bytes.to_str(r.batch.records[0].value), "v")
+        Err(f) => test.fail(f.message())
+
+    test.case("and one of -2 is malformed rather than a length read unsigned")
+    match kafkarecords.decode_batch(a_hand_built_batch(a_record_with_key_length(-2)), 0, set)
+        Ok(_)  => test.fail("a length below -1 is not a length")
+        Err(f) => test.assert_eq_str(kafkaerror.fault_code(f), "null_not_allowed")
+
+    test.case("nor is the record's own length nullable at all")
+    match kafkarecords.decode_batch(a_hand_built_batch(a_record_of_null_length()), 0, set)
+        Ok(_)  => test.fail("a record length of -1 is not a record")
+        Err(f) => test.assert_eq_str(kafkaerror.fault_code(f), "null_not_allowed")
+
+@test
+fn test_a_trailing_partial_batch_is_dropped_rather_than_refused() [io]
+    let set = kafkarecords.no_codecs()
+    let whole = kafkarecords.encode_batch(
+        kafkarecords.append(kafkarecords.batch(0, 1789000000000),
+                            kafkarecords.record(bytes.from_str("k"), bytes.from_str("v"))),
+                            set)!
+    let trailing = bytes.concat([whole, bytes.zeros(3)])
+    match kafkarecords.decode_batches(trailing, set)
+        Ok(bs) =>
+            test.assert_eq(list.len(bs), 1)
+            test.assert_eq(list.len(bs[0].records), 1)
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_a_partition_with_nothing_to_send_writes_a_null_record_set() [io]
+    let set = kafkarecords.no_codecs()
+    let raw = kafkaresp.encode_response(KafkaFetchResp(a_fetch_reply_with_nothing_to_send()),
+                                        4, 2, set)!
+    // The record set is the last field of a v4 reply — every
+    // tagged-field section after it is empty in the classic spelling
+    // and writes nothing — so the last four bytes are the null.
+    let tail = bytes.slice(raw, bytes.len(raw) - 4, bytes.len(raw))
+    let field = kafkaprim.read_bytes(kafkaprim.cursor(tail, kafkaprim.KafkaClassic))!
+    test.assert(field.is_null)
+
+    test.case("and a reader of that null answers an empty batch list")
+    match kafkaresp.decode_response(raw, KafkaFetch, 4, set)
+        Ok(r)  =>
+            match r
+                KafkaFetchResp(v) =>
+                    test.assert_eq(list.len(v.topics), 1)
+                    test.assert_eq_str(v.topics[0].name, "orders")
+                    test.assert_eq(list.len(v.topics[0].partitions[0].batches), 0)
+                    test.assert_eq(v.topics[0].partitions[0].high_watermark, 41)
+                _                 => test.fail("a Fetch buffer is a fetch response")
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_a_produce_replys_per_record_errors_are_consumed_not_mistaken_for_fields() [io]
+    let set = kafkarecords.no_codecs()
+    match kafkaresp.decode_response(a_produce_reply_with_a_rejected_record(5),
+                                    KafkaProduce, 9, set)
+        Ok(r)  =>
+            match r
+                KafkaProduceResp(v) =>
+                    test.assert_eq(list.len(v.topics), 1)
+                    test.assert_eq_str(v.topics[0].name, "orders")
+                    test.assert_eq(v.topics[0].partitions[0].base_offset, 7)
+                    test.assert_eq(v.topics[0].partitions[0].log_start_offset, 3)
+                    // The throttle comes AFTER the results in a Produce
+                    // reply, which is the opposite of every other one.
+                    test.assert_eq(v.throttle_time_ms, 100)
+                _                   => test.fail("a Produce buffer is a produce response")
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_a_version_the_package_does_not_encode_is_refused_before_any_bytes() [io]
+    let set = kafkarecords.no_codecs()
+
+    test.case("a request above the key's range is refused by `encode_request`")
+    let h = kafkahdr.request_header(KafkaHeartbeat, 9, 1, "edge-client")
+    let r = KafkaHeartbeatReq(kafkareq.heartbeat_request("edge-group", 1, "edge-member"))
+    match kafkareq.encode_request(h, r, set)
+        Ok(_)  => test.fail("Heartbeat stops at v4")
+        Err(f) => test.assert_eq_str(kafkaerror.fault_code(f), "unsupported_version")
+
+    test.case("and a reply at one is refused on both sides of the codec")
+    match kafkaresp.decode_response(bytes.zeros(0), KafkaProduce, 2, set)
+        Ok(_)  => test.fail("Produce starts at v3")
+        Err(f) => test.assert_eq_str(kafkaerror.fault_code(f), "unsupported_version")
+    match kafkaresp.encode_response(
+        KafkaHeartbeatResp(kafkaresp.empty_heartbeat_response()), 9, 1, set)
+        Ok(_)  => test.fail("Heartbeat stops at v4")
+        Err(f) => test.assert_eq_str(kafkaerror.fault_code(f), "unsupported_version")
+
+    test.case("while a body with a byte left over is the version that is wrong, not the bytes")
+    let one = kafkaresp.encode_response(
+        KafkaHeartbeatResp(kafkaresp.empty_heartbeat_response()), 4, 3, set)!
+    match kafkaresp.decode_response(bytes.concat([one, bytes.zeros(1)]), KafkaHeartbeat, 4, set)
+        Ok(_)  => test.fail("a decoded body with a byte left over is not the body")
+        Err(f) => test.assert_eq_str(kafkaerror.fault_code(f), "trailing_bytes")
+
+@test
+fn test_a_field_a_version_cannot_carry_is_refused_where_its_absence_would_mislead() [io]
+    // `check_encodable` is asked before a connection is chosen, so a
+    // client talking to a mixed-version cluster routes the request
+    // rather than discovering the refusal at the encode.
+    let transactional = KafkaProduceRequest { transactional_id: "edge-tx",
+                                              transactional_id_is_null: false,
+                                              acks: -1, timeout_ms: 30000, topics: [] }
+
+    test.case("a transactional id below Produce v3")
+    match kafkareq.check_encodable(KafkaProduceReq(transactional), 2)
+        Some(f) => test.assert_eq_str(kafkaerror.fault_code(f), "not_encodable")
+        None    => test.fail("a Produce below v3 cannot carry a transactional id")
+
+    test.case("and the same request at v3, where the field arrives")
+    match kafkareq.check_encodable(KafkaProduceReq(transactional), 3)
+        Some(_) => test.fail("v3 is where the field arrives")
+        None    => test.assert(true)
+
+@test
+fn test_a_forgotten_topic_is_written_at_the_versions_that_carry_one() [io]
+    let here = [KafkaFetchPartition { index: 0, current_leader_epoch: -1, fetch_offset: 5,
+                                      log_start_offset: -1, partition_max_bytes: 1048576 }]
+    let gone = [KafkaFetchTopic { name: "gone",
+                                  partitions: [KafkaFetchPartition { index: 3,
+                                                                     current_leader_epoch: -1,
+                                                                     fetch_offset: 0,
+                                                                     log_start_offset: -1,
+                                                                     partition_max_bytes: 1048576 }] }]
+    let with_forgotten = fetch_wire(a_fetch_with(here, gone), 7)
+    let without = fetch_wire(a_fetch_with(here, []), 7)
+    // One forgotten topic at v7 costs the name, the partition count and
+    // one index — (2 + 4) + 4 + 4 = 14 bytes — and nothing else: the
+    // array count is written either way, an empty array as a zero, and
+    // the tagged-field sections are empty in the classic spelling.
+    test.assert_eq(bytes.len(with_forgotten) - bytes.len(without), 14)
+
+    test.case("and a version that has no such field writes the same bytes either way")
+    test.assert_eq(bytes.len(fetch_wire(a_fetch_with(here, gone), 4)),
+                   bytes.len(fetch_wire(a_fetch_with(here, []), 4)))
+
+@test
+fn test_a_headers_client_id_and_tagged_fields_are_the_header_versions_question() [io]
+    test.case("a flexible header takes tagged fields")
+    let flexible = kafkahdr.request_header(KafkaMetadata, 9, 1, "edge-client")
+    test.assert_eq(kafkahdr.request_header_version(flexible), 2)
+    let field = KafkaTaggedField { tag: 1, data: bytes.from_str("x") }
+    match kafkahdr.with_tagged(flexible, [field])
+        Ok(h)  => test.assert_eq(list.len(h.tagged), 1)
+        Err(f) => test.fail(f.message())
+
+    test.case("and refuses them on a header version with no section to put them in")
+    match kafkahdr.with_tagged(kafkahdr.request_header(KafkaApiVersions, 0, 1, "edge-client"), [])
+        Ok(_)  => test.fail("a v1 header has nowhere to put tagged fields")
+        Err(f) => test.assert_eq_str(kafkaerror.fault_code(f), "not_encodable")
+
+    test.case("while a null client id is two bytes of null where eleven bytes of text would be")
+    let nulled = kafkahdr.with_null_client_id(
+        kafkahdr.request_header(KafkaApiVersions, 0, 4, "edge-client"))
+    let raw = request_header_wire(nulled, 0)
+    // The key and the version are two bytes each, the correlation id
+    // four, and the client id is the null — against `2 + 11` for the
+    // same header carrying "edge-client".
+    test.assert_eq(bytes.len(raw), 10)
+    match kafkahdr.decode_request_header(kafkaprim.cursor(raw, kafkaprim.KafkaClassic))
+        Ok(r)  =>
+            test.assert(r.header.client_id_is_null)
+            test.assert_eq_str(r.header.client_id, "")
+        Err(f) => test.fail(f.message())
+    test.assert_eq(bytes.len(request_header_wire(
+        kafkahdr.request_header(KafkaApiVersions, 0, 4, "edge-client"), 0)),
+        21)
+
+@test
+fn test_a_broker_floor_above_the_packages_is_where_the_two_ranges_meet() [io]
+    // Produce v5..v9 at the broker against v3..v9 here: the intersection
+    // is v5..v9, and `negotiate` answers its top.  A broker whose floor
+    // is above this package's own is the ordinary case of talking to a
+    // newer broker, and it is the arm of the `higher`/`lower` pair the
+    // suites never take.
+    let broker = [KafkaApiSupport { key: 0, min_version: 5, max_version: 9 }]
+    match kafkaapi.negotiate(KafkaProduce, broker)
+        Ok(v)  => test.assert_eq(v, 9)
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_a_faults_message_is_the_sentence_fault_message_writes() [io]
+    // `KafkaFault` is an `Error` so that `Result<T, KafkaFault>` exists
+    // at all; `.message()` is that impl and it is the sentence a
+    // `main` prints when a `!` carries a fault out to the top.
+    let f = kafkaerror.KafkaTruncated(4, 7, "a record batch")
+    test.assert_eq_str(f.message(), kafkaerror.fault_message(f))
+    test.assert(str.len(f.message()) > 0)

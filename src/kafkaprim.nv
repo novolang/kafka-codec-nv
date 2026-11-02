@@ -2,8 +2,6 @@
 // and the two halves of a codec: a cursor that reads and a writer that
 // builds.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE PROTOCOL HAS TWO SPELLINGS OF EVERY VARIABLE-LENGTH FIELD, AND
 // WHICH ONE APPLIES IS A PROPERTY OF THE REQUEST VERSION.  Before
 // KIP-482 a string was an `int16` byte count followed by UTF-8, with
@@ -50,6 +48,72 @@
 // whole frame here" without committing to decoding it.
 
 use kafkaerror
+
+// A cursor moved to `offset`, with the same buffer, style and ceiling.
+fn advanced(c: KafkaCursor, offset: Int) -> KafkaCursor
+    KafkaCursor { buf: c.buf, offset: offset, style: c.style, max_bytes: c.max_bytes }
+
+// Whether `width` bytes are left at the cursor.
+fn enough(c: KafkaCursor, width: Int) -> Bool
+    bytes.len(c.buf) - c.offset >= width
+
+// The refusal for a field the buffer ends in the middle of.
+//
+// `want` is how many more bytes the field needed and the offset is
+// where the buffer ended, so a reader on a stream is told both how much
+// to read and that nothing is wrong yet.
+fn truncated(c: KafkaCursor, width: Int, field: Str) -> kafkaerror.KafkaFault
+    let have = bytes.len(c.buf) - c.offset
+    kafkaerror.KafkaTruncated(bytes.len(c.buf), width - have, field)
+
+// The `width`-byte big-endian signed integer at the cursor.
+//
+// The caller has checked that the bytes are there.  The stdlib's
+// readers answer unsigned values, so the high half is folded down here
+// rather than at every read site; `width` is two or four.
+fn signed_at(c: KafkaCursor, width: Int) -> Int
+    if width == 2
+        let raw = bytes.u16_be_at(c.buf, c.offset) ?? 0
+        if raw >= 32768
+            return raw - 65536
+        raw
+    else
+        let raw = bytes.u32_be_at(c.buf, c.offset) ?? 0
+        if raw >= 2147483648
+            return raw - 4294967296
+        raw
+
+// A length or element count, in the cursor's spelling.
+//
+// `width` is the classic spelling's length width — two bytes for a
+// string, four for a byte string or an array.  `-1` is the classic
+// null and `0` is the flexible one; a classic count that is negative
+// and not `-1` is refused rather than read as a huge unsigned size,
+// which is the classic defect of a Kafka codec.
+fn read_count(c: KafkaCursor, width: Int, field: Str) -> Result<KafkaLenRead, kafkaerror.KafkaFault>
+    if style_of(c) == KafkaClassic
+        if not enough(c, width)
+            return Err(truncated(c, width, field))
+        let raw = signed_at(c, width)
+        if raw == -1
+            return Ok(KafkaLenRead { cursor: advanced(c, c.offset + width), count: 0, is_null: true })
+        if raw < 0
+            return Err(kafkaerror.KafkaNullNotAllowed(c.offset, field))
+        Ok(KafkaLenRead { cursor: advanced(c, c.offset + width), count: raw, is_null: false })
+    else
+        let r = read_uvarint(c)!
+        if r.value == 0
+            return Ok(KafkaLenRead { cursor: r.cursor, count: 0, is_null: true })
+        // A ten-byte varint can set the sign bit, which no count is.
+        if r.value < 0
+            return Err(kafkaerror.KafkaNullNotAllowed(c.offset, field))
+        Ok(KafkaLenRead { cursor: r.cursor, count: r.value - 1, is_null: false })
+
+// A writer with `piece` appended.
+fn appended(w: KafkaWriter, piece: Bytes) -> KafkaWriter
+    let parts = [w.out, piece]
+    let out = bytes.concat(parts)
+    KafkaWriter { out: out, style: w.style }
 
 // Which of the two spellings of the variable-length fields a message
 // uses.
@@ -164,7 +228,7 @@ pub struct KafkaWriter
 //     println("${kafkaprim.remaining(c)}")                // 2
 // ```
 pub fn cursor(buf: Bytes, style: KafkaWireStyle) -> KafkaCursor
-    todo("kafka-codec-nv.kafkaprim.cursor")
+    KafkaCursor { buf: buf, offset: 0, style: style, max_bytes: 0 }
 
 // The same cursor with a length ceiling.
 //
@@ -177,7 +241,7 @@ pub fn cursor(buf: Bytes, style: KafkaWireStyle) -> KafkaCursor
 //     println("${c.max_bytes}")
 // ```
 pub fn with_max_bytes(c: KafkaCursor, max_bytes: Int) -> KafkaCursor
-    todo("kafka-codec-nv.kafkaprim.with_max_bytes")
+    KafkaCursor { buf: c.buf, offset: c.offset, style: c.style, max_bytes: max_bytes }
 
 // A cursor at a given offset in the same buffer.
 //
@@ -185,11 +249,11 @@ pub fn with_max_bytes(c: KafkaCursor, max_bytes: Int) -> KafkaCursor
 // inside a produce request — to another module without copying the
 // bytes out.
 pub fn at(c: KafkaCursor, offset: Int) -> KafkaCursor
-    todo("kafka-codec-nv.kafkaprim.at")
+    advanced(c, offset)
 
 // How many bytes are left after the cursor.
 pub fn remaining(c: KafkaCursor) -> Int
-    todo("kafka-codec-nv.kafkaprim.remaining")
+    bytes.len(c.buf) - c.offset
 
 // Whether the cursor is at the end of its buffer.
 //
@@ -197,11 +261,11 @@ pub fn remaining(c: KafkaCursor) -> Int
 // — see `kafkaerror.KafkaTrailingBytes`, which is almost always a
 // version mismatch rather than corruption.
 pub fn at_end(c: KafkaCursor) -> Bool
-    todo("kafka-codec-nv.kafkaprim.at_end")
+    c.offset >= bytes.len(c.buf)
 
 // Which wire style the cursor is reading.
 pub fn style_of(c: KafkaCursor) -> KafkaWireStyle
-    todo("kafka-codec-nv.kafkaprim.style_of")
+    c.style
 
 // ── fixed-width integers ─────────────────────────────────────────────
 
@@ -216,18 +280,31 @@ pub fn style_of(c: KafkaCursor) -> KafkaWireStyle
 //         Err(_) => println("truncated")
 // ```
 pub fn read_int8(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_int8")
+    if not enough(c, 1)
+        return Err(truncated(c, 1, "int8"))
+    let raw = bytes.byte_at(c.buf, c.offset) ?? 0
+    let value = if raw >= 128
+        raw - 256
+    else
+        raw
+    Ok(KafkaIntRead { cursor: advanced(c, c.offset + 1), value: value })
 
 // A big-endian signed 16-bit integer.
 //
 // Every multi-byte integer in this protocol is big-endian, in every
 // version, with no exception; the module never asks.
 pub fn read_int16(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_int16")
+    if not enough(c, 2)
+        return Err(truncated(c, 2, "int16"))
+    let value = signed_at(c, 2)
+    Ok(KafkaIntRead { cursor: advanced(c, c.offset + 2), value: value })
 
 // A big-endian signed 32-bit integer.
 pub fn read_int32(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_int32")
+    if not enough(c, 4)
+        return Err(truncated(c, 4, "int32"))
+    let value = signed_at(c, 4)
+    Ok(KafkaIntRead { cursor: advanced(c, c.offset + 4), value: value })
 
 // A big-endian signed 64-bit integer.
 //
@@ -236,7 +313,15 @@ pub fn read_int32(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
 // `int64` count of milliseconds since the Unix epoch and `-1` means
 // "no timestamp".
 pub fn read_int64(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_int64")
+    if not enough(c, 8)
+        return Err(truncated(c, 8, "int64"))
+    // Read as two halves and recombine bitwise: an `Int` is a 64-bit
+    // two's-complement value, so the pattern is the signed answer with
+    // no fold-down arithmetic that could itself overflow.
+    let hi = bytes.u32_be_at(c.buf, c.offset) ?? 0
+    let lo = bytes.u32_be_at(c.buf, c.offset + 4) ?? 0
+    let value = (hi << 32) | lo
+    Ok(KafkaIntRead { cursor: advanced(c, c.offset + 8), value: value })
 
 // A big-endian UNSIGNED 32-bit integer, as a non-negative `Int`.
 //
@@ -245,7 +330,10 @@ pub fn read_int64(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
 // number and a comparison against a checksum library's output would
 // then fail on.
 pub fn read_uint32(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_uint32")
+    if not enough(c, 4)
+        return Err(truncated(c, 4, "uint32"))
+    let value = bytes.u32_be_at(c.buf, c.offset) ?? 0
+    Ok(KafkaIntRead { cursor: advanced(c, c.offset + 4), value: value })
 
 // A boolean, and the cursor after it.
 pub struct KafkaBoolRead
@@ -256,7 +344,10 @@ pub struct KafkaBoolRead
 //
 // "Anything else" is the protocol's rule and not a leniency here.
 pub fn read_bool(c: KafkaCursor) -> Result<KafkaBoolRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_bool")
+    if not enough(c, 1)
+        return Err(truncated(c, 1, "bool"))
+    let raw = bytes.byte_at(c.buf, c.offset) ?? 0
+    Ok(KafkaBoolRead { cursor: advanced(c, c.offset + 1), value: raw != 0 })
 
 // A 16-byte UUID, as the 32-character lower-case hyphenated text.
 //
@@ -264,7 +355,12 @@ pub fn read_bool(c: KafkaCursor) -> Result<KafkaBoolRead, kafkaerror.KafkaFault>
 // because the only thing a caller does with one is compare it and log
 // it, and a 16-byte value in a log is unreadable.
 pub fn read_uuid(c: KafkaCursor) -> Result<KafkaStrRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_uuid")
+    if not enough(c, 16)
+        return Err(truncated(c, 16, "uuid"))
+    let raw = bytes.slice(c.buf, c.offset, c.offset + 16)
+    let hex = bytes.to_hex(raw)
+    let text = "${str.slice(hex, 0, 8)}-${str.slice(hex, 8, 12)}-${str.slice(hex, 12, 16)}-${str.slice(hex, 16, 20)}-${str.slice(hex, 20, 32)}"
+    Ok(KafkaStrRead { cursor: advanced(c, c.offset + 16), value: text, is_null: false })
 
 // ── variable-length integers ─────────────────────────────────────────
 
@@ -285,7 +381,21 @@ pub fn read_uuid(c: KafkaCursor) -> Result<KafkaStrRead, kafkaerror.KafkaFault>
 //         Err(_) => println("not a varint")
 // ```
 pub fn read_uvarint(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_uvarint")
+    var value = 0
+    var shift = 0
+    var cur = c
+    var i = 0
+    while i < 10
+        if not enough(cur, 1)
+            return Err(truncated(cur, 1, "varint"))
+        let b = bytes.byte_at(cur.buf, cur.offset) ?? 0
+        value = value | ((b & 0x7F) << shift)
+        cur = advanced(cur, cur.offset + 1)
+        i += 1
+        if b < 128
+            return Ok(KafkaIntRead { cursor: cur, value: value })
+        shift += 7
+    Err(kafkaerror.KafkaBadVarint(c.offset, "longer than ten bytes"))
 
 // A zigzag-encoded signed varint, 32 bits wide.
 //
@@ -294,25 +404,45 @@ pub fn read_uvarint(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFaul
 // of five.  A record's length, offset delta, key length and value
 // length are all this.
 pub fn read_varint(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_varint")
+    let r = read_uvarint(c)!
+    let half = r.value >> 1
+    let value = if (r.value & 1) == 1
+        0 - half - 1
+    else
+        half
+    Ok(KafkaIntRead { cursor: r.cursor, value: value })
 
 // A zigzag-encoded signed varint, 64 bits wide.
 //
 // A record's timestamp delta, which is a millisecond count and
 // routinely exceeds 32 bits on a batch that spans time.
 pub fn read_varlong(c: KafkaCursor) -> Result<KafkaIntRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_varlong")
+    let r = read_uvarint(c)!
+    let half = r.value >> 1
+    let value = if (r.value & 1) == 1
+        0 - half - 1
+    else
+        half
+    Ok(KafkaIntRead { cursor: r.cursor, value: value })
 
 // How many bytes an unsigned varint of this value occupies.
 //
 // Needed before the value is written, because a record batch's length
 // field precedes a body whose size depends on the lengths inside it.
 pub fn uvarint_size(v: Int) -> Int
-    todo("kafka-codec-nv.kafkaprim.uvarint_size")
+    var n = v
+    var size = 1
+    while n < 0 or n >= 128
+        n = n >>> 7
+        size += 1
+    size
 
 // How many bytes a zigzag signed varint of this value occupies.
 pub fn varint_size(v: Int) -> Int
-    todo("kafka-codec-nv.kafkaprim.varint_size")
+    // Zigzag as bit arithmetic, so that the two extremes of `Int` do
+    // not overflow on the way to the encoded value.
+    let z = (v << 1) ^ (v >> 63)
+    uvarint_size(z)
 
 // ── strings, bytes and arrays ────────────────────────────────────────
 
@@ -334,7 +464,18 @@ pub fn varint_size(v: Int) -> Int
 //         Err(_) => println("truncated")
 // ```
 pub fn read_str(c: KafkaCursor) -> Result<KafkaStrRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_str")
+    let n = read_count(c, 2, "string")!
+    if n.is_null
+        return Ok(KafkaStrRead { cursor: n.cursor, value: "", is_null: true })
+    if n.cursor.max_bytes > 0 and n.count > n.cursor.max_bytes
+        return Err(kafkaerror.KafkaFrameTooLarge(n.count, n.cursor.max_bytes))
+    if not enough(n.cursor, n.count)
+        return Err(truncated(n.cursor, n.count, "string"))
+    let raw = bytes.slice(n.cursor.buf, n.cursor.offset, n.cursor.offset + n.count)
+    let value = bytes.to_str(raw)
+    Ok(KafkaStrRead { cursor: advanced(n.cursor, n.cursor.offset + n.count),
+        value: value,
+        is_null: false })
 
 // A string that the protocol says may not be null.
 //
@@ -343,21 +484,41 @@ pub fn read_str(c: KafkaCursor) -> Result<KafkaStrRead, kafkaerror.KafkaFault>
 // needs is "this broker sent a null topic name", not "the topic name
 // was empty".
 pub fn read_required_str(c: KafkaCursor, field: Str) -> Result<KafkaStrRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_required_str")
+    let r = read_str(c)!
+    if r.is_null
+        return Err(kafkaerror.KafkaNullNotAllowed(c.offset, field))
+    Ok(r)
 
 // A byte string, in whichever spelling the cursor's style says.
 //
 // Bytes and not `Str`: a record key or value is arbitrary binary, and
 // a `Str` would make a protobuf payload unreadable.
 pub fn read_bytes(c: KafkaCursor) -> Result<KafkaBytesRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_bytes")
+    let n = read_count(c, 4, "bytes")!
+    if n.is_null
+        return Ok(KafkaBytesRead { cursor: n.cursor, value: bytes.zeros(0), is_null: true })
+    if n.cursor.max_bytes > 0 and n.count > n.cursor.max_bytes
+        return Err(kafkaerror.KafkaFrameTooLarge(n.count, n.cursor.max_bytes))
+    if not enough(n.cursor, n.count)
+        return Err(truncated(n.cursor, n.count, "bytes"))
+    let value = bytes.slice(n.cursor.buf, n.cursor.offset, n.cursor.offset + n.count)
+    Ok(KafkaBytesRead { cursor: advanced(n.cursor, n.cursor.offset + n.count),
+        value: value,
+        is_null: false })
 
 // A byte string of a known length, taken raw.
 //
 // What a decoder uses for a record batch's body, which it hands to
 // `kafkarecords` rather than interpreting here.
 pub fn read_raw(c: KafkaCursor, n: Int) -> Result<KafkaBytesRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_raw")
+    if n < 0
+        return Err(kafkaerror.KafkaNullNotAllowed(c.offset, "raw bytes"))
+    if c.max_bytes > 0 and n > c.max_bytes
+        return Err(kafkaerror.KafkaFrameTooLarge(n, c.max_bytes))
+    if not enough(c, n)
+        return Err(truncated(c, n, "raw bytes"))
+    let value = bytes.slice(c.buf, c.offset, c.offset + n)
+    Ok(KafkaBytesRead { cursor: advanced(c, c.offset + n), value: value, is_null: false })
 
 // An array's element count, in whichever spelling the cursor's style
 // says.
@@ -374,7 +535,7 @@ pub fn read_raw(c: KafkaCursor, n: Int) -> Result<KafkaBytesRead, kafkaerror.Kaf
 //         Err(_) => println("truncated")
 // ```
 pub fn read_array_len(c: KafkaCursor) -> Result<KafkaLenRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_array_len")
+    read_count(c, 4, "array")
 
 // ── tagged fields ────────────────────────────────────────────────────
 
@@ -401,7 +562,25 @@ pub fn read_array_len(c: KafkaCursor) -> Result<KafkaLenRead, kafkaerror.KafkaFa
 //         Err(_) => println("malformed section")
 // ```
 pub fn read_tagged_fields(c: KafkaCursor) -> Result<KafkaTagsRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.read_tagged_fields")
+    if style_of(c) == KafkaClassic
+        return Ok(KafkaTagsRead { cursor: c, fields: [] })
+    let n = read_uvarint(c)!
+    var fields: [KafkaTaggedField] = []
+    var cur = n.cursor
+    var last = -1
+    var i = 0
+    while i < n.value
+        let tag_r = read_uvarint(cur)!
+        if tag_r.value <= last
+            return Err(kafkaerror.KafkaBadTaggedFields(tag_r.cursor.offset, "tags are not ascending"))
+        let size_r = read_uvarint(tag_r.cursor)!
+        let raw = read_raw(size_r.cursor, size_r.value)!
+        let one = [KafkaTaggedField { tag: tag_r.value, data: raw.value }]
+        fields = list.concat(fields, one)
+        cur = raw.cursor
+        last = tag_r.value
+        i += 1
+    Ok(KafkaTagsRead { cursor: cur, fields: fields })
 
 // The bytes of one tag from a decoded section, or `None`.
 //
@@ -409,7 +588,14 @@ pub fn read_tagged_fields(c: KafkaCursor) -> Result<KafkaTagsRead, kafkaerror.Ka
 // and what it does NOT need for the ones it does not, because those
 // travel in the list and are written back untouched.
 pub fn tagged_field(fields: [KafkaTaggedField], tag: Int) -> ?Bytes
-    todo("kafka-codec-nv.kafkaprim.tagged_field")
+    for f in fields
+        if f.tag == tag
+            // A copy, because a plain return cannot hand back a buffer
+            // reachable from the plain parameter `fields` [E2038]: the
+            // caller would hold a name it may write through and the
+            // section it came from is meant to be read-only.
+            return Some(bytes.clone(f.data))
+    None
 
 // ── writing ──────────────────────────────────────────────────────────
 
@@ -423,47 +609,64 @@ pub fn tagged_field(fields: [KafkaTaggedField], tag: Int) -> ?Bytes
 //     println("${bytes.len(kafkaprim.finish(w))}")      // 0
 // ```
 pub fn writer(style: KafkaWireStyle) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.writer")
+    KafkaWriter { out: bytes.zeros(0), style: style }
 
 // One signed byte.
 pub fn write_int8(w: KafkaWriter, v: Int) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_int8")
+    appended(w, bytes.u8(v))
 
 // A big-endian signed 16-bit integer.
 pub fn write_int16(w: KafkaWriter, v: Int) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_int16")
+    appended(w, bytes.u16_be(v))
 
 // A big-endian signed 32-bit integer.
 pub fn write_int32(w: KafkaWriter, v: Int) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_int32")
+    appended(w, bytes.u32_be(v))
 
 // A big-endian signed 64-bit integer.
 pub fn write_int64(w: KafkaWriter, v: Int) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_int64")
+    appended(w, bytes.u64_be(v))
 
 // A big-endian unsigned 32-bit integer.  The CRC field's writer.
 pub fn write_uint32(w: KafkaWriter, v: Int) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_uint32")
+    appended(w, bytes.u32_be(v))
 
 // A boolean, as `0` or `1`.
 pub fn write_bool(w: KafkaWriter, v: Bool) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_bool")
+    if v
+        appended(w, bytes.u8(1))
+    else
+        appended(w, bytes.u8(0))
 
 // A UUID, from the hyphenated text, as sixteen bytes.
 pub fn write_uuid(w: KafkaWriter, text: Str) -> Result<KafkaWriter, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.write_uuid")
+    if str.len(text) != 36
+        return Err(kafkaerror.KafkaNotEncodable("uuid", "not the 36-character hyphenated form"))
+    let hex = "${str.slice(text, 0, 8)}${str.slice(text, 9, 13)}${str.slice(text, 14, 18)}${str.slice(text, 19, 23)}${str.slice(text, 24, 36)}"
+    let Some(raw) = bytes.from_hex(hex) else return Err(kafkaerror.KafkaNotEncodable("uuid", "not sixteen hex bytes"))
+    Ok(appended(w, raw))
 
 // An unsigned varint.
 pub fn write_uvarint(w: KafkaWriter, v: Int) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_uvarint")
+    // `n < 0` is the top half of an unsigned 64-bit value, which the
+    // logical shift walks down the same way; `uvarint_size` uses the
+    // same test, so the two never disagree about a width.
+    var n = v
+    var out = w
+    while n < 0 or n >= 128
+        out = write_int8(out, (n & 0x7F) | 0x80)
+        n = n >>> 7
+    write_int8(out, n & 0x7F)
 
 // A zigzag signed varint, 32 bits wide.
 pub fn write_varint(w: KafkaWriter, v: Int) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_varint")
+    let z = (v << 1) ^ (v >> 63)
+    write_uvarint(w, z)
 
 // A zigzag signed varint, 64 bits wide.
 pub fn write_varlong(w: KafkaWriter, v: Int) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_varlong")
+    let z = (v << 1) ^ (v >> 63)
+    write_uvarint(w, z)
 
 // A string, in whichever spelling the writer's style says.
 //
@@ -480,7 +683,14 @@ pub fn write_varlong(w: KafkaWriter, v: Int) -> KafkaWriter
 //         Err(_) => println("too long to encode")
 // ```
 pub fn write_str(w: KafkaWriter, v: Str) -> Result<KafkaWriter, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.write_str")
+    let raw = bytes.from_str(v)
+    let n = bytes.len(raw)
+    if w.style == KafkaClassic
+        if n > 32767
+            return Err(kafkaerror.KafkaNotEncodable("string", "longer than an int16 length can hold"))
+        Ok(appended(write_int16(w, n), raw))
+    else
+        Ok(appended(write_uvarint(w, n + 1), raw))
 
 // A null string: `-1` on a classic writer, `0` on a flexible one.
 //
@@ -488,15 +698,25 @@ pub fn write_str(w: KafkaWriter, v: Str) -> Result<KafkaWriter, kafkaerror.Kafka
 // and empty are different answers and the difference should be
 // visible at the call site — see `read_str`.
 pub fn write_null_str(w: KafkaWriter) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_null_str")
+    if w.style == KafkaClassic
+        write_int16(w, -1)
+    else
+        write_uvarint(w, 0)
 
 // A byte string, in whichever spelling the writer's style says.
 pub fn write_bytes(w: KafkaWriter, v: Bytes) -> Result<KafkaWriter, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.write_bytes")
+    let n = bytes.len(v)
+    if w.style == KafkaClassic
+        Ok(appended(write_int32(w, n), v))
+    else
+        Ok(appended(write_uvarint(w, n + 1), v))
 
 // A null byte string.
 pub fn write_null_bytes(w: KafkaWriter) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_null_bytes")
+    if w.style == KafkaClassic
+        write_int32(w, -1)
+    else
+        write_uvarint(w, 0)
 
 // Bytes with no length prefix at all.
 //
@@ -504,16 +724,28 @@ pub fn write_null_bytes(w: KafkaWriter) -> KafkaWriter
 // and the reason `kafkarecords.encode_batch` can answer `Bytes`
 // instead of having to write into this module's writer.
 pub fn write_raw(w: KafkaWriter, v: Bytes) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_raw")
+    appended(w, v)
 
 // An array's element count, in whichever spelling the writer's style
 // says.
 pub fn write_array_len(w: KafkaWriter, count: Int) -> Result<KafkaWriter, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkaprim.write_array_len")
+    // A negative count written as a classic `int32` is `-1`, which the
+    // peer reads as a null array: `write_null_array` is the spelled
+    // form of that, so a negative count here is refused rather than
+    // silently asking for something else.
+    if count < 0 or count > 2147483647
+        return Err(kafkaerror.KafkaNotEncodable("array", "a negative or too large element count"))
+    if w.style == KafkaClassic
+        Ok(write_int32(w, count))
+    else
+        Ok(write_uvarint(w, count + 1))
 
 // A null array.
 pub fn write_null_array(w: KafkaWriter) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_null_array")
+    if w.style == KafkaClassic
+        write_int32(w, -1)
+    else
+        write_uvarint(w, 0)
 
 // A tagged-field section.
 //
@@ -531,11 +763,26 @@ pub fn write_null_array(w: KafkaWriter) -> KafkaWriter
 //     println("${bytes.len(kafkaprim.finish(w))}")      // 1 — the zero count
 // ```
 pub fn write_tagged_fields(w: KafkaWriter, fields: [KafkaTaggedField]) -> KafkaWriter
-    todo("kafka-codec-nv.kafkaprim.write_tagged_fields")
+    if w.style == KafkaClassic
+        w
+    else
+        // Ascending tags, whatever order they arrived in: a caller that
+        // appended to a decoded section would otherwise emit one a
+        // conforming decoder refuses.
+        let sorted = list.sort_by(list.clone(fields), f => f.tag)
+        var out = write_uvarint(w, list.len(sorted))
+        for f in sorted
+            out = write_uvarint(out, f.tag)
+            out = write_uvarint(out, bytes.len(f.data))
+            out = appended(out, f.data)
+        out
 
 // The bytes written so far.
 pub fn finish(w: KafkaWriter) -> Bytes
-    todo("kafka-codec-nv.kafkaprim.finish")
+    // A copy, because a plain return cannot hand back a buffer
+    // reachable from the plain parameter `w` [E2038].  It is one copy
+    // per finished message, not per write.
+    bytes.clone(w.out)
 
 // How many bytes the writer holds.
 //
@@ -544,4 +791,4 @@ pub fn finish(w: KafkaWriter) -> Bytes
 // learning the answer as `KafkaErrMessageTooLarge` after the round
 // trip.
 pub fn written(w: KafkaWriter) -> Int
-    todo("kafka-codec-nv.kafkaprim.written")
+    bytes.len(w.out)

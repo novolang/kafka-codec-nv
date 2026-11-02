@@ -1,12 +1,11 @@
 // kafkaprim_tests.nv — the API suite for the two spellings and the two
 // varints.
 //
-// RED ON PURPOSE, like every suite here: each assertion reaches
-// `not implemented: kafka-codec-nv.kafkaprim.<fn>`.  What is asserted
-// is the design — that the wire style is carried rather than passed per
-// field, that null and empty are different answers, that the unsigned
-// and the zigzag varint are separate functions, and that a
-// tagged-field section costs nothing on a classic message.
+// What is asserted is the design — that the wire style is carried
+// rather than passed per field, that null and empty are different
+// answers, that the unsigned and the zigzag varint are separate
+// functions, and that a tagged-field section costs nothing on a classic
+// message.
 
 use std.test
 use kafkaprim

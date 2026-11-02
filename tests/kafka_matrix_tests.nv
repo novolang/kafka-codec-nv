@@ -1,0 +1,982 @@
+// kafka_matrix_tests.nv — the version matrix: every API at every
+// version this package encodes, in both directions.
+//
+// The five API suites state the design.  This one exists so that the
+// branch each encoder and decoder takes AT A VERSION is taken rather
+// than argued about: every `if version >= n` in `kafkareq` and
+// `kafkaresp` is a branch no test reached until one asked at a version
+// on each side of `n`.  A codec is the one kind of package where a
+// branch that was never run is a branch that is wrong.
+//
+// Nothing here is a new claim about the protocol.  What is claimed is
+// that the published tables — the version ranges, the flexible floors,
+// the header versions, the error-code numbers, the compression ids —
+// are consistent with the encoders that read them, for every key and
+// every version, and that a response written by `encode_response`
+// comes back out of `decode_response` as the value it went in as.
+
+use std.test
+use kafkaapi
+use kafkaerror
+use kafkahdr
+use kafkaprim
+use kafkarecords
+use kafkareq
+use kafkaresp
+
+// ── what is iterated ─────────────────────────────────────────────────
+
+// Every API key this package encodes.
+fn every_key() -> [kafkaapi.KafkaApiKey]
+    kafkaapi.all_api_keys()
+
+// Every error code this package names, plus one it does not.
+fn every_error_code() -> [kafkaerror.KafkaErrorCode]
+    [KafkaErrNone, KafkaErrUnknownServer, KafkaErrOffsetOutOfRange,
+     KafkaErrCorruptMessage, KafkaErrUnknownTopicOrPartition,
+     KafkaErrInvalidFetchSize, KafkaErrLeaderNotAvailable,
+     KafkaErrNotLeaderOrFollower, KafkaErrRequestTimedOut,
+     KafkaErrBrokerNotAvailable, KafkaErrReplicaNotAvailable,
+     KafkaErrMessageTooLarge, KafkaErrOffsetMetadataTooLarge,
+     KafkaErrNetworkException, KafkaErrCoordinatorLoadInProgress,
+     KafkaErrCoordinatorNotAvailable, KafkaErrNotCoordinator,
+     KafkaErrInvalidTopic, KafkaErrRecordListTooLarge,
+     KafkaErrNotEnoughReplicas, KafkaErrNotEnoughReplicasAfterAppend,
+     KafkaErrInvalidRequiredAcks, KafkaErrIllegalGeneration,
+     KafkaErrInconsistentGroupProtocol, KafkaErrInvalidGroupId,
+     KafkaErrUnknownMemberId, KafkaErrInvalidSessionTimeout,
+     KafkaErrRebalanceInProgress, KafkaErrInvalidCommitOffsetSize,
+     KafkaErrTopicAuthorizationFailed, KafkaErrGroupAuthorizationFailed,
+     KafkaErrClusterAuthorizationFailed, KafkaErrInvalidTimestamp,
+     KafkaErrUnsupportedSaslMechanism, KafkaErrIllegalSaslState,
+     KafkaErrUnsupportedVersion, KafkaErrTopicAlreadyExists,
+     KafkaErrInvalidPartitions, KafkaErrInvalidReplicationFactor,
+     KafkaErrNotController, KafkaErrInvalidRequest,
+     KafkaErrUnsupportedForMessageFormat, KafkaErrPolicyViolation,
+     KafkaErrOutOfOrderSequence, KafkaErrDuplicateSequence,
+     KafkaErrInvalidProducerEpoch, KafkaErrStorageError,
+     KafkaErrSaslAuthenticationFailed, KafkaErrFencedLeaderEpoch,
+     KafkaErrUnknownLeaderEpoch, KafkaErrUnsupportedCompressionType,
+     KafkaErrOffsetNotAvailable, KafkaErrMemberIdRequired,
+     KafkaErrGroupMaxSizeReached, KafkaErrFencedInstanceId,
+     KafkaErrUnstableOffsetCommit, KafkaErrOther(31337)]
+
+// One of every fault this codec can raise, so that no variant ships
+// without a message, a metric code and a fatality answer.
+fn every_fault() -> [kafkaerror.KafkaFault]
+    [kafkaerror.KafkaTruncated(3, 4, "int16"),
+     kafkaerror.KafkaBadVarint(9, "eleven continuation bytes"),
+     kafkaerror.KafkaNullNotAllowed(11, "topic name"),
+     kafkaerror.KafkaFrameTooLarge(1048576, 4096),
+     kafkaerror.KafkaTrailingBytes(21, 6),
+     kafkaerror.KafkaUnknownApiKey(29),
+     kafkaerror.KafkaUnsupportedVersion(0, 1, 3, 9),
+     kafkaerror.KafkaUnsupportedVersion(0, -1, 3, 9),
+     kafkaerror.KafkaCorrelationMismatch(7),
+     kafkaerror.KafkaBadMagic(1),
+     kafkaerror.KafkaBadCrc(3808858755, 123),
+     kafkaerror.KafkaUnknownCompression(5),
+     kafkaerror.KafkaCompressionNotSupplied("snappy"),
+     kafkaerror.KafkaCodecFailed("zstd", "bad frame header"),
+     kafkaerror.KafkaRecordCountMismatch(3, 2),
+     kafkaerror.KafkaNotEncodable("string", "too long for an int16 length"),
+     kafkaerror.KafkaBadTaggedFields(44, "tags are not ascending")]
+
+// ── kafkaapi ─────────────────────────────────────────────────────────
+
+@test
+fn test_every_api_key_answers_a_number_a_name_and_a_version_range() [io]
+    let keys = every_key()
+    test.case("the number is on the wire and the name is in the protocol guide")
+    for k in keys
+        test.assert(kafkaapi.api_key_number(k) >= 0)
+        let name = kafkaapi.api_key_name(k)
+        test.assert(str.len(name) > 0)
+        match kafkaapi.api_key_of_number(kafkaapi.api_key_number(k))
+            Ok(back) => test.assert(kafkaapi.api_key_name(back) == name)
+            Err(_)   => test.fail("a key this package encodes must answer its own number")
+
+    test.case("every key encodes its own range and refuses one past each end")
+    for k in keys
+        let r = kafkaapi.supported_versions(k)
+        test.assert(r.min <= r.max)
+        test.assert(kafkaapi.supports(k, r.min))
+        test.assert(kafkaapi.supports(k, r.max))
+        test.assert(not kafkaapi.supports(k, r.max + 1))
+        match kafkaapi.check_version(k, r.min)
+            None    => test.assert(true)
+            Some(_) => test.fail("the floor of a key's own range is a version it encodes")
+        match kafkaapi.check_version(k, r.min - 1)
+            None    => test.fail("one below the floor is not a version this package encodes")
+            Some(_) => test.assert(true)
+
+    test.case("the flexible floor is where the style changes, inside the range or one past it")
+    // One past the top is a real state and `Fetch` is in it: this
+    // release reads v4 through v11 and the flexible spelling starts at
+    // v12, so every Fetch it encodes is classic.  Asserting the floor
+    // is inside the range would have been wrong and asserting the
+    // style at the FLOOR is still right either way.
+    for k in keys
+        let floor = kafkaapi.flexible_from(k)
+        let r = kafkaapi.supported_versions(k)
+        test.assert(floor <= r.max + 1)
+        test.assert(kafkaapi.is_flexible(k, floor))
+        test.assert(not kafkaapi.is_flexible(k, floor - 1))
+        match kafkaapi.wire_style(k, floor)
+            KafkaFlexible => test.assert(true)
+            KafkaClassic  => test.fail("the flexible floor is where the spelling changes")
+        match kafkaapi.wire_style(k, floor - 1)
+            KafkaClassic  => test.assert(true)
+            KafkaFlexible => test.fail("the version below the floor is the classic spelling")
+        if floor > r.max
+            match kafkaapi.wire_style(k, r.max)
+                KafkaClassic  => test.assert(true)
+                KafkaFlexible => test.fail("a key this release stops short of is classic at its top")
+
+    test.case("and `Fetch` is the key that is in it")
+    test.assert(kafkaapi.flexible_from(KafkaFetch) == 12)
+    let fetch_range = kafkaapi.supported_versions(KafkaFetch)
+    test.assert(fetch_range.max == 11)
+    match kafkaapi.wire_style(KafkaFetch, 11)
+        KafkaClassic  => test.assert(true)
+        KafkaFlexible => test.fail("v11 is the last Fetch this release encodes, and it is classic")
+
+    test.case("a flexible message gets a header with a tagged-field section, and no other does")
+    for k in keys
+        let r = kafkaapi.supported_versions(k)
+        var v = r.min
+        while v <= r.max
+            let flex = kafkaapi.is_flexible(k, v)
+            let hv = kafkaapi.header_request_version(k, v)
+            if flex
+                test.assert(hv == 2)
+            else
+                test.assert(hv == 1)
+            // The `ApiVersions` exception, and nothing else is one.
+            let rv = kafkaapi.header_response_version(k, v)
+            if k == KafkaApiVersions
+                test.assert(rv == 0)
+            elif flex
+                test.assert(rv == 1)
+            else
+                test.assert(rv == 0)
+            v = v + 1
+
+    test.case("negotiation picks the highest version both sides speak")
+    var broker: [kafkaapi.KafkaApiSupport] = []
+    for k in keys
+        let r = kafkaapi.supported_versions(k)
+        let line = KafkaApiSupport { key: kafkaapi.api_key_number(k),
+                                     min_version: r.min, max_version: r.max }
+        broker = list.push(broker, line)
+    for k in keys
+        match kafkaapi.negotiate(k, broker)
+            Ok(v)  => test.assert(kafkaapi.supports(k, v))
+            Err(_) => test.fail("a broker listing this key's whole range overlaps it")
+
+    test.case("and refuses a key the broker never listed")
+    let one = [KafkaApiSupport { key: 1, min_version: 0, max_version: 9 }]
+    match kafkaapi.negotiate(KafkaProduce, one)
+        Ok(_)  => test.fail("the broker did not list Produce")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "unsupported_version")
+
+    test.case("and refuses a key whose range does not meet this package's")
+    let old = [KafkaApiSupport { key: 0, min_version: 0, max_version: 2 }]
+    match kafkaapi.negotiate(KafkaProduce, old)
+        Ok(_)  => test.fail("Produce v0 through v2 is a message set this package does not read")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "unsupported_version")
+
+    test.case("`negotiate_all` answers one entry per key both sides can speak")
+    let chosen = kafkaapi.negotiate_all(broker)
+    test.assert(list.len(chosen) == list.len(keys))
+    let nothing = kafkaapi.negotiate_all(one)
+    test.assert(list.len(nothing) == 1)
+    test.assert(nothing[0].key == 1)
+
+@test
+fn test_every_error_code_carries_its_number_its_name_and_its_advice() [io]
+    let codes = every_error_code()
+    test.case("the number and the name round-trip, named or not")
+    for c in codes
+        let n = kafkaerror.error_code_number(c)
+        test.assert(str.len(kafkaerror.error_code_name(c)) > 0)
+        test.assert(kafkaerror.error_code_number(kafkaerror.error_code_of_number(n)) == n)
+        // Four questions, and every code answers each of them with a
+        // `Bool` rather than by being left out.
+        let retriable = kafkaerror.is_retriable(c)
+        let metadata = kafkaerror.needs_metadata_refresh(c)
+        let coordinator = kafkaerror.needs_coordinator_refresh(c)
+        let permission = kafkaerror.is_authorization_failure(c)
+        test.assert(retriable or not retriable)
+        test.assert(metadata or not metadata)
+        test.assert(coordinator or not coordinator)
+        test.assert(permission or not permission)
+
+    test.case("every number from the wire lands on a code")
+    var n = -1
+    while n <= 90
+        let c = kafkaerror.error_code_of_number(n)
+        test.assert(kafkaerror.error_code_number(c) == n or c == KafkaErrOther(n))
+        n = n + 1
+
+    test.case("the classes are disjoint where they must be")
+    test.assert(kafkaerror.is_retriable(KafkaErrLeaderNotAvailable))
+    test.assert(kafkaerror.needs_metadata_refresh(KafkaErrNotLeaderOrFollower))
+    test.assert(kafkaerror.needs_coordinator_refresh(KafkaErrNotCoordinator))
+    test.assert(kafkaerror.is_authorization_failure(KafkaErrTopicAuthorizationFailed))
+    test.assert(kafkaerror.is_authorization_failure(KafkaErrSaslAuthenticationFailed))
+    test.assert(not kafkaerror.is_authorization_failure(KafkaErrInvalidRequest))
+
+@test
+fn test_every_fault_has_a_message_a_metric_code_and_a_fatality_answer() [io]
+    let faults = every_fault()
+    test.case("a person reads the message and a metric reads the code")
+    for f in faults
+        test.assert(str.len(kafkaerror.fault_message(f)) > 0)
+        let code = kafkaerror.fault_code(f)
+        test.assert(str.len(code) > 0)
+        // A metric label may not carry anything the wire supplied.
+        test.assert(not str.contains(code, " "))
+        let fatal = kafkaerror.is_fatal_to_connection(f)
+        test.assert(fatal or not fatal)
+
+    test.case("only the faults that lose the framing are fatal to the connection")
+    test.assert(kafkaerror.is_fatal_to_connection(kafkaerror.KafkaCorrelationMismatch(7)))
+    test.assert(kafkaerror.is_fatal_to_connection(kafkaerror.KafkaBadVarint(1, "d")))
+    test.assert(kafkaerror.is_fatal_to_connection(kafkaerror.KafkaTrailingBytes(1, 1)))
+    test.assert(not kafkaerror.is_fatal_to_connection(kafkaerror.KafkaTruncated(0, 4, "frame")))
+    test.assert(not kafkaerror.is_fatal_to_connection(kafkaerror.KafkaBadCrc(1, 2)))
+
+    test.case("the version message reads differently for a listed key and an unlisted one")
+    let listed = kafkaerror.fault_message(kafkaerror.KafkaUnsupportedVersion(0, 1, 3, 9))
+    let unlisted = kafkaerror.fault_message(kafkaerror.KafkaUnsupportedVersion(0, -1, 3, 9))
+    test.assert(str.len(listed) > 0)
+    test.assert(str.len(unlisted) > 0)
+    test.assert(not listed == unlisted)
+
+// ── the requests ─────────────────────────────────────────────────────
+
+// One batch with two records, a header on the first, so that the
+// produce path carries a record's own header section as well as its
+// key and value.
+fn a_batch() -> kafkarecords.KafkaRecordBatch
+    var b = kafkarecords.batch(0, 1735689600000)
+    let key = bytes.from_str("orders-0")
+    let value = bytes.from_str("payload")
+    var r = kafkarecords.record(key, value)
+    let header = KafkaRecordHeader { key: "trace-id", value: bytes.from_str("abc123") }
+    r = kafkarecords.with_headers(r, [header])
+    r = kafkarecords.record_at(r, 1735689600007)
+    b = kafkarecords.append(b, r)
+    let deleted = kafkarecords.tombstone(bytes.from_str("orders-1"))
+    b = kafkarecords.append(b, deleted)
+    b
+
+// One `Produce` request with a transactional id, a batch, and a
+// timeout.
+fn a_produce_request() -> kafkareq.KafkaRequest
+    let b = a_batch()
+    let part = KafkaProducePartition { index: 0, batches: [b] }
+    let topic = KafkaProduceTopic { name: "orders", partitions: [part] }
+    KafkaProduceReq(KafkaProduceRequest {
+        transactional_id: "tx-1", transactional_id_is_null: false,
+        acks: -1, timeout_ms: 30000, topics: [topic] })
+
+// One `Fetch` request with a rack, a forgotten topic and a session.
+// The rack is refused below v11 by `check_encodable`, which is what
+// the matrix asserts rather than skips.
+fn a_fetch_request() -> kafkareq.KafkaRequest
+    let part = KafkaFetchPartition { index: 0, current_leader_epoch: 4,
+                                     fetch_offset: 100, log_start_offset: -1,
+                                     partition_max_bytes: 1048576 }
+    let topic = KafkaFetchTopic { name: "orders", partitions: [part] }
+    let forgotten = KafkaFetchTopic { name: "orders-archive", partitions: [] }
+    KafkaFetchReq(KafkaFetchRequest {
+        replica_id: -1, max_wait_ms: 500, min_bytes: 1, max_bytes: 52428800,
+        isolation_level: 1, session_id: 7, session_epoch: 3,
+        topics: [topic], forgotten_topics: [forgotten], rack_id: "rack-a" })
+
+fn a_list_offsets_request() -> kafkareq.KafkaRequest
+    let part = KafkaListOffsetsPartition { index: 2, current_leader_epoch: 5,
+                                           timestamp: kafkareq.latest_offset() }
+    let topic = KafkaListOffsetsTopic { name: "orders", partitions: [part] }
+    KafkaListOffsetsReq(KafkaListOffsetsRequest { replica_id: -1, isolation_level: 1,
+                                                  topics: [topic] })
+
+fn a_name() -> [Str]
+    ["orders", "payments"]
+
+fn a_metadata_request() -> kafkareq.KafkaRequest
+    KafkaMetadataReq(KafkaMetadataRequest {
+        topics: a_name(), topics_is_null: false,
+        allow_auto_topic_creation: true, include_topic_authorized_operations: true })
+
+fn a_metadata_all_request() -> kafkareq.KafkaRequest
+    KafkaMetadataReq(KafkaMetadataRequest {
+        topics: [], topics_is_null: true,
+        allow_auto_topic_creation: false, include_topic_authorized_operations: false })
+
+fn a_find_coordinator_request() -> kafkareq.KafkaRequest
+    KafkaFindCoordinatorReq(KafkaFindCoordinatorRequest { key: "orders-group", key_type: 1 })
+
+fn a_join_group_request() -> kafkareq.KafkaRequest
+    let sub = KafkaJoinGroupProtocol { name: "range", metadata: bytes.from_str("sub") }
+    KafkaJoinGroupReq(KafkaJoinGroupRequest {
+        group_id: "orders-group", session_timeout_ms: 45000, rebalance_timeout_ms: 60000,
+        member_id: "member-1", group_instance_id: "instance-1",
+        group_instance_id_is_null: false, protocol_type: "consumer", protocols: [sub] })
+
+fn a_sync_group_request() -> kafkareq.KafkaRequest
+    let assign = KafkaSyncGroupAssignment { member_id: "member-1",
+                                            assignment: bytes.from_str("assign") }
+    KafkaSyncGroupReq(KafkaSyncGroupRequest {
+        group_id: "orders-group", generation_id: 12, member_id: "member-1",
+        group_instance_id: "instance-1", group_instance_id_is_null: false,
+        protocol_type: "consumer", protocol_name: "range", assignments: [assign] })
+
+fn a_heartbeat_request() -> kafkareq.KafkaRequest
+    KafkaHeartbeatReq(KafkaHeartbeatRequest {
+        group_id: "orders-group", generation_id: 12, member_id: "member-1",
+        group_instance_id: "instance-1", group_instance_id_is_null: false })
+
+// One partition with metadata and one without, so both spellings of
+// the commit's nullable metadata field are written.
+fn an_offset_commit_request() -> kafkareq.KafkaRequest
+    let with_meta = KafkaOffsetCommitPartition { index: 0, committed_offset: 101,
+                                                 committed_leader_epoch: 6,
+                                                 metadata: "note", metadata_is_null: false }
+    let without = KafkaOffsetCommitPartition { index: 1, committed_offset: 202,
+                                               committed_leader_epoch: -1,
+                                               metadata: "", metadata_is_null: true }
+    let topic = KafkaOffsetCommitTopic { name: "orders", partitions: [with_meta, without] }
+    KafkaOffsetCommitReq(KafkaOffsetCommitRequest {
+        group_id: "orders-group", generation_id: 12, member_id: "member-1",
+        group_instance_id: "instance-1", group_instance_id_is_null: false,
+        topics: [topic] })
+
+fn an_offset_fetch_request() -> kafkareq.KafkaRequest
+    let topic = KafkaOffsetFetchTopic { name: "orders", partition_indexes: [0, 1] }
+    KafkaOffsetFetchReq(KafkaOffsetFetchRequest {
+        group_id: "orders-group", topics: [topic], topics_is_null: false,
+        require_stable: true })
+
+fn an_offset_fetch_all_request() -> kafkareq.KafkaRequest
+    KafkaOffsetFetchReq(KafkaOffsetFetchRequest {
+        group_id: "orders-group", topics: [], topics_is_null: true,
+        require_stable: false })
+
+// Every request this package encodes, including the two whose
+// interesting value is the null list.
+fn every_request() -> [kafkareq.KafkaRequest]
+    [KafkaApiVersionsReq(kafkareq.api_versions_request("novo-kafka-nv", "0.0.1")),
+     a_metadata_request(),
+     a_metadata_all_request(),
+     a_produce_request(),
+     a_fetch_request(),
+     a_list_offsets_request(),
+     a_find_coordinator_request(),
+     a_join_group_request(),
+     a_sync_group_request(),
+     a_heartbeat_request(),
+     an_offset_commit_request(),
+     an_offset_fetch_request(),
+     an_offset_fetch_all_request()]
+
+@test
+fn test_every_request_encodes_at_every_version_this_release_supports() [io]
+    let requests = every_request()
+    test.case("thirteen values cover the eleven keys, null lists included")
+    test.assert(list.len(requests) == 13)
+
+    test.case("and each one writes bytes, or is refused for a field the version cannot carry")
+    for r in requests
+        let key = kafkareq.request_api_key(r)
+        let range = kafkaapi.supported_versions(key)
+        // A request built by a caller that meant every field it set:
+        // what the encoder does with the fields is the question here.
+        var v = range.min
+        while v <= range.max
+            let h = kafkahdr.request_header(key, v, 1, "matrix-client")
+            match kafkareq.check_encodable(r, v)
+                Some(_) =>
+                    match kafkareq.encode_request(h, r, kafkarecords.no_codecs())
+                        Ok(_)  => test.fail("a field this version cannot carry must be refused, not dropped")
+                        Err(_) => test.assert(true)
+                None    =>
+                    match kafkareq.encode_request(h, r, kafkarecords.no_codecs())
+                        Ok(raw) => test.assert(bytes.len(raw) > 0)
+                        Err(_)  => test.fail("the version table says this version is encodable")
+            v = v + 1
+
+    test.case("the two fields that refuse below their version are the two the README names")
+    let fetch = a_fetch_request()
+    let join = a_join_group_request()
+    match kafkareq.check_encodable(fetch, 10)
+        Some(f) => test.assert(kafkaerror.fault_code(f) == "not_encodable")
+        None    => test.fail("a rack id on a Fetch below v11 changes where the bytes come from")
+    match kafkareq.check_encodable(fetch, 11)
+        None    => test.assert(true)
+        Some(_) => test.fail("v11 carries the rack id")
+    match kafkareq.check_encodable(join, 4)
+        Some(f) => test.assert(kafkaerror.fault_code(f) == "not_encodable")
+        None    => test.fail("a group instance id on a JoinGroup below v5 is refused")
+    match kafkareq.check_encodable(join, 5)
+        None    => test.assert(true)
+        Some(_) => test.fail("v5 carries the group instance id")
+    match kafkareq.check_encodable(a_heartbeat_request(), 0)
+        None    => test.assert(true)
+        Some(_) => test.fail("a heartbeat carries no field a version cannot")
+
+// ── the responses ────────────────────────────────────────────────────
+
+// One broker with a rack and one without, so both spellings of the
+// nullable rack are written.
+fn some_brokers() -> [KafkaBrokerInfo]
+    [KafkaBrokerInfo { node_id: 1, host: "broker-1", port: 9092,
+                       rack: "rack-a", rack_is_null: false },
+     KafkaBrokerInfo { node_id: 2, host: "broker-2", port: 9092,
+                       rack: "", rack_is_null: true }]
+
+fn a_partition_info() -> KafkaPartitionInfo
+    KafkaPartitionInfo { error_code: KafkaErrNone, index: 0, leader_id: 1,
+                         leader_epoch: 7, replica_nodes: [1, 2],
+                         isr_nodes: [1, 2], offline_replicas: [2] }
+
+fn a_metadata_response() -> kafkaresp.KafkaResponse
+    let topic = KafkaTopicInfo { error_code: KafkaErrNone, name: "orders",
+                                 topic_id: "", is_internal: false,
+                                 partitions: [a_partition_info()] }
+    KafkaMetadataResp(KafkaMetadataResponse {
+        throttle_time_ms: 55, brokers: some_brokers(), cluster_id: "cluster-1",
+        controller_id: 1, topics: [topic] })
+
+fn a_produce_response() -> kafkaresp.KafkaResponse
+    let part = KafkaProduceResult { index: 0, error_code: KafkaErrNone,
+                                    base_offset: 10, log_append_time_ms: 1735689600000,
+                                    log_start_offset: 0 }
+    let topic = KafkaProduceTopicResult { name: "orders", partitions: [part] }
+    KafkaProduceResp(KafkaProduceResponse { topics: [topic], throttle_time_ms: 12 })
+
+fn a_fetch_response() -> kafkaresp.KafkaResponse
+    let b = a_batch()
+    let aborted = KafkaAbortedTransaction { producer_id: 9, first_offset: 100 }
+    let part = KafkaFetchResult { index: 0, error_code: KafkaErrNone, high_watermark: 500,
+                                  last_stable_offset: 500, log_start_offset: 0,
+                                  aborted_transactions: [aborted],
+                                  preferred_read_replica: 1, batches: [b] }
+    let topic = KafkaFetchTopicResult { name: "orders", partitions: [part] }
+    KafkaFetchResp(KafkaFetchResponse { throttle_time_ms: 3, error_code: KafkaErrNone,
+                                        session_id: 7, topics: [topic] })
+
+fn a_list_offsets_response() -> kafkaresp.KafkaResponse
+    let part = KafkaListOffsetsResult { index: 0, error_code: KafkaErrNone,
+                                        timestamp: 1735689600000, offset: 42,
+                                        leader_epoch: 7 }
+    let topic = KafkaListOffsetsTopicResult { name: "orders", partitions: [part] }
+    KafkaListOffsetsResp(KafkaListOffsetsResponse { throttle_time_ms: 1, topics: [topic] })
+
+fn a_find_coordinator_response() -> kafkaresp.KafkaResponse
+    KafkaFindCoordinatorResp(KafkaFindCoordinatorResponse {
+        throttle_time_ms: 2, error_code: KafkaErrNone, error_message: "",
+        error_message_is_null: true, node_id: 1, host: "broker-1", port: 9092 })
+
+fn a_join_group_response() -> kafkaresp.KafkaResponse
+    let fixed = KafkaJoinGroupMember { member_id: "member-1", group_instance_id: "instance-1",
+                                        group_instance_id_is_null: false,
+                                        metadata: bytes.from_str("sub-1") }
+    let dynamic = KafkaJoinGroupMember { member_id: "member-2", group_instance_id: "",
+                                         group_instance_id_is_null: true,
+                                         metadata: bytes.from_str("sub-2") }
+    KafkaJoinGroupResp(KafkaJoinGroupResponse {
+        throttle_time_ms: 0, error_code: KafkaErrMemberIdRequired, generation_id: 12,
+        protocol_type: "consumer", protocol_name: "range", leader: "member-1",
+        member_id: "member-1", members: [fixed, dynamic] })
+
+fn a_sync_group_response() -> kafkaresp.KafkaResponse
+    KafkaSyncGroupResp(KafkaSyncGroupResponse {
+        throttle_time_ms: 0, error_code: KafkaErrNone, protocol_type: "consumer",
+        protocol_name: "range", assignment: bytes.from_str("assign") })
+
+fn a_heartbeat_response() -> kafkaresp.KafkaResponse
+    KafkaHeartbeatResp(KafkaHeartbeatResponse { throttle_time_ms: 0,
+                                                error_code: KafkaErrRebalanceInProgress })
+
+fn an_offset_commit_response() -> kafkaresp.KafkaResponse
+    let ok = KafkaOffsetCommitResult { index: 0, error_code: KafkaErrNone }
+    let stale = KafkaOffsetCommitResult { index: 1, error_code: KafkaErrIllegalGeneration }
+    let topic = KafkaOffsetCommitTopicResult { name: "orders", partitions: [ok, stale] }
+    KafkaOffsetCommitResp(KafkaOffsetCommitResponse { throttle_time_ms: 4, topics: [topic] })
+
+// One partition with metadata and one without, so both spellings of
+// the nullable commit metadata are read back.
+fn an_offset_fetch_response() -> kafkaresp.KafkaResponse
+    let noted = KafkaOffsetFetchResult { index: 0, committed_offset: 101,
+                                         committed_leader_epoch: 6, metadata: "note",
+                                         metadata_is_null: false, error_code: KafkaErrNone }
+    let nothing = KafkaOffsetFetchResult { index: 1, committed_offset: -1,
+                                           committed_leader_epoch: -1, metadata: "",
+                                           metadata_is_null: true,
+                                           error_code: KafkaErrUnstableOffsetCommit }
+    let topic = KafkaOffsetFetchTopicResult { name: "orders", partitions: [noted, nothing] }
+    KafkaOffsetFetchResp(KafkaOffsetFetchResponse {
+        throttle_time_ms: 5, topics: [topic], error_code: KafkaErrNone })
+
+fn an_api_versions_response() -> kafkaresp.KafkaResponse
+    let produce = KafkaApiSupport { key: 0, min_version: 3, max_version: 9 }
+    let versions = KafkaApiSupport { key: 18, min_version: 0, max_version: 3 }
+    KafkaApiVersionsResp(KafkaApiVersionsResponse {
+        error_code: KafkaErrNone, api_keys: [produce, versions], throttle_time_ms: 42 })
+
+fn every_response() -> [kafkaresp.KafkaResponse]
+    [an_api_versions_response(),
+     a_metadata_response(),
+     a_produce_response(),
+     a_fetch_response(),
+     a_list_offsets_response(),
+     a_find_coordinator_response(),
+     a_join_group_response(),
+     a_sync_group_response(),
+     a_heartbeat_response(),
+     an_offset_commit_response(),
+     an_offset_fetch_response()]
+
+@test
+fn test_every_response_round_trips_at_every_version_this_release_supports() [io]
+    let responses = every_response()
+    test.case("all eleven keys are represented, once each")
+    test.assert(list.len(responses) == 11)
+
+    test.case("and each value encodes, decodes and encodes to the same bytes")
+    // Byte equality rather than field equality, because it is the
+    // stronger claim AND the honest one: a version that cannot carry a
+    // field drops it from the bytes, and the value read back is then
+    // what the bytes say, not what went in.  A codec whose reader and
+    // writer disagree about where a field lives fails here at the
+    // version where they disagree.
+    for r in responses
+        let key = kafkaresp.response_api_key(r)
+        let range = kafkaapi.supported_versions(key)
+        var v = range.min
+        while v <= range.max
+            match kafkaresp.encode_response(r, v, 77, kafkarecords.no_codecs())
+                Ok(raw) =>
+                    match kafkaresp.decode_response(raw, key, v, kafkarecords.no_codecs())
+                        Ok(back) =>
+                            match kafkaresp.encode_response(back, v, 77, kafkarecords.no_codecs())
+                                Ok(again) =>
+                                    let first = bytes.to_hex(raw)
+                                    let second = bytes.to_hex(again)
+                                    test.assert(first == second)
+                                Err(_)    => test.fail("a value this package wrote must encode again")
+                        Err(_)   => test.fail("a value this package wrote must decode")
+                Err(_)  => test.fail("the version table says this version is encodable")
+            v = v + 1
+
+    test.case("the accessors answer for every arm")
+    var seen: [kafkaapi.KafkaApiKey] = []
+    for r in responses
+        let key = kafkaresp.response_api_key(r)
+        seen = list.push(seen, key)
+        test.assert(kafkaresp.throttle_time_of(r) >= 0)
+        let errors = kafkaresp.errors_of(r)
+        test.assert(kafkaresp.is_all_ok(r) == (list.len(errors) == 0))
+        match kafkaresp.high_watermark_of(r, "orders", 0)
+            Some(w) => test.assert(w == 500)
+            None    => test.assert(not key == KafkaFetch)
+        let batches = kafkaresp.all_batches(r)
+        if key == KafkaFetch
+            test.assert(list.len(batches) == 1)
+        else
+            test.assert(list.len(batches) == 0)
+    test.assert(list.len(seen) == 11)
+
+    test.case("a non-`None` code anywhere is found by `first_error`")
+    let failed = a_heartbeat_response()
+    match kafkaresp.first_error(failed)
+        Some(c) => test.assert(c == KafkaErrRebalanceInProgress)
+        None    => test.fail("the heartbeat carries a rebalance in progress")
+    match kafkaresp.first_error(an_api_versions_response())
+        Some(_) => test.fail("the `ApiVersions` reply carries no error")
+        None    => test.assert(true)
+    let commits = an_offset_commit_response()
+    let found = kafkaresp.errors_of(commits)
+    test.assert(list.len(found) == 1)
+    test.assert(found[0].partition == 1)
+    test.assert(not kafkaresp.is_all_ok(commits))
+
+    test.case("and a fetch response's high watermark is per partition")
+    match kafkaresp.high_watermark_of(a_fetch_response(), "payments", 0)
+        Some(_) => test.fail("the fetch response is about `orders`")
+        None    => test.assert(true)
+    match kafkaresp.high_watermark_of(a_fetch_response(), "orders", 1)
+        Some(_) => test.fail("the fetch response is about partition 0")
+        None    => test.assert(true)
+
+// ── kafkaprim: the reads and writes with no happy path ───────────────
+
+@test
+fn test_the_primitive_readers_refuse_what_they_cannot_read() [io]
+    let empty = bytes.zeros(0)
+    test.case("a fixed-width read past the end is truncation, not a default")
+    match kafkaprim.read_int8(kafkaprim.cursor(empty, KafkaClassic))
+        Ok(_)  => test.fail("no bytes at all is not an int8")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+    match kafkaprim.read_uint32(kafkaprim.cursor(empty, KafkaClassic))
+        Ok(_)  => test.fail("no bytes at all is not a uint32")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+    match kafkaprim.read_bool(kafkaprim.cursor(empty, KafkaClassic))
+        Ok(_)  => test.fail("no bytes at all is not a bool")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+    match kafkaprim.read_uuid(kafkaprim.cursor(empty, KafkaClassic))
+        Ok(_)  => test.fail("a uuid is sixteen bytes")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+
+    test.case("an int8 is signed, so the byte `0xFF` is `-1`")
+    match kafkaprim.read_int8(kafkaprim.cursor(bytes.u8(255), KafkaClassic))
+        Ok(r)  => test.assert(r.value == -1)
+        Err(_) => test.fail("one byte is an int8")
+
+    test.case("a varint is read seven bits at a time and refuses an eleventh byte")
+    match kafkaprim.read_uvarint(kafkaprim.cursor(bytes.from_byte_list([0xAC, 0x02]), KafkaClassic))
+        Ok(r)  => test.assert(r.value == 300)
+        Err(_) => test.fail("`0xAC 0x02` is 300")
+    let endless = bytes.from_byte_list([0x80, 0x80, 0x80, 0x80, 0x80,
+                                        0x80, 0x80, 0x80, 0x80, 0x80, 0x00])
+    match kafkaprim.read_uvarint(kafkaprim.cursor(endless, KafkaClassic))
+        Ok(_)  => test.fail("a varint is at most ten bytes")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "bad_varint")
+
+    test.case("a string's length is believed only as far as the cursor's ceiling")
+    let announced = kafkaprim.cursor(bytes.u16_be(100), KafkaClassic)
+    match kafkaprim.read_str(kafkaprim.with_max_bytes(announced, 4))
+        Ok(_)  => test.fail("a hundred bytes past a four-byte ceiling is refused")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "frame_too_large")
+    match kafkaprim.read_str(announced)
+        Ok(_)  => test.fail("two bytes do not hold a hundred")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+
+    test.case("a required string is refused when the wire says null")
+    match kafkaprim.read_required_str(kafkaprim.cursor(bytes.u16_be(-1), KafkaClassic), "topic name")
+        Ok(_)  => test.fail("a topic name is not nullable")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "null_not_allowed")
+
+    test.case("and a byte string's four-byte length the same way")
+    let four = kafkaprim.cursor(bytes.u32_be(100), KafkaClassic)
+    match kafkaprim.read_bytes(kafkaprim.with_max_bytes(four, 4))
+        Ok(_)  => test.fail("a hundred bytes past a four-byte ceiling is refused")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "frame_too_large")
+    match kafkaprim.read_bytes(four)
+        Ok(_)  => test.fail("four bytes do not hold a hundred")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+
+    test.case("a raw run refuses a negative length, a length past the ceiling and a short buffer")
+    let raw_cur = kafkaprim.cursor(bytes.from_str("abc"), KafkaClassic)
+    match kafkaprim.read_raw(raw_cur, -1)
+        Ok(_)  => test.fail("a negative run is not a run")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "null_not_allowed")
+    match kafkaprim.read_raw(kafkaprim.with_max_bytes(raw_cur, 2), 3)
+        Ok(_)  => test.fail("three bytes past a two-byte ceiling is refused")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "frame_too_large")
+    match kafkaprim.read_raw(raw_cur, 3)
+        Ok(r)  => test.assert(bytes.len(r.value) == 3)
+        Err(_) => test.fail("three bytes are there")
+    match kafkaprim.read_raw(raw_cur, 4)
+        Ok(_)  => test.fail("the buffer holds three")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+
+    test.case("a tagged-field section reads its fields and refuses disorder")
+    let section = bytes.from_byte_list([2, 0, 1, 97, 1, 2, 98, 99])
+    match kafkaprim.read_tagged_fields(kafkaprim.cursor(section, KafkaFlexible))
+        Ok(r)  =>
+            test.assert(list.len(r.fields) == 2)
+            match kafkaprim.tagged_field(r.fields, 1)
+                Some(d) => test.assert(bytes.len(d) == 2)
+                None    => test.fail("tag 1 is in the section")
+            match kafkaprim.tagged_field(r.fields, 9)
+                Some(_) => test.fail("there is no tag 9")
+                None    => test.assert(true)
+        Err(_) => test.fail("two ascending tags is a well-formed section")
+    let disordered = bytes.from_byte_list([2, 1, 1, 97, 0, 1, 98])
+    match kafkaprim.read_tagged_fields(kafkaprim.cursor(disordered, KafkaFlexible))
+        Ok(_)  => test.fail("tags must ascend")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "bad_tagged_fields")
+
+    test.case("and a classic cursor has no section at all")
+    match kafkaprim.read_tagged_fields(kafkaprim.cursor(bytes.zeros(0), KafkaClassic))
+        Ok(r)  => test.assert(list.len(r.fields) == 0)
+        Err(_) => test.fail("a classic message has no tagged-field section")
+
+@test
+fn test_the_primitive_writers_refuse_what_they_cannot_write() [io]
+    test.case("a uuid that is not the thirty-six-character form is refused")
+    match kafkaprim.write_uuid(kafkaprim.writer(KafkaClassic), "not-a-uuid")
+        Ok(_)  => test.fail("a uuid is `8-4-4-4-12` hexadecimal")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "not_encodable")
+    match kafkaprim.write_uuid(kafkaprim.writer(KafkaClassic),
+                               "00000000-0000-0000-0000-000000000001")
+        Ok(w)  => test.assert(kafkaprim.written(w) == 16)
+        Err(_) => test.fail("that one is the hyphenated form")
+
+    test.case("a varint of more than seven bits takes a second byte")
+    let w = kafkaprim.write_uvarint(kafkaprim.writer(KafkaClassic), 300)
+    test.assert(bytes.len(kafkaprim.finish(w)) == 2)
+
+    test.case("a string past what an int16 length holds is refused, not truncated")
+    let long = str.repeat("x", 40000)
+    match kafkaprim.write_str(kafkaprim.writer(KafkaClassic), long)
+        Ok(_)  => test.fail("a classic string's length is an int16")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "not_encodable")
+    match kafkaprim.write_str(kafkaprim.writer(KafkaFlexible), long)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("a compact string's length is a varint and holds it")
+
+    test.case("an array count that is negative or past an int32 is refused")
+    match kafkaprim.write_array_len(kafkaprim.writer(KafkaClassic), -1)
+        Ok(_)  => test.fail("a negative count is `write_null_array`'s job")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "not_encodable")
+    match kafkaprim.write_array_len(kafkaprim.writer(KafkaClassic), 2147483648)
+        Ok(_)  => test.fail("a count past an int32 has no encoding")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "not_encodable")
+
+    test.case("a tagged-field section writes its fields ascending, whatever order they came in")
+    let jumbled = [KafkaTaggedField { tag: 3, data: bytes.from_str("c") },
+                   KafkaTaggedField { tag: 1, data: bytes.from_str("a") }]
+    let out = kafkaprim.write_tagged_fields(kafkaprim.writer(KafkaFlexible), jumbled)
+    let written = kafkaprim.finish(out)
+    // count 2, then tag 1's field, then tag 3's: the writer sorted them.
+    match kafkaprim.read_tagged_fields(kafkaprim.cursor(written, KafkaFlexible))
+        Ok(r)  => test.assert(list.len(r.fields) == 2)
+        Err(_) => test.fail("what the writer wrote must be what the reader reads")
+    // And a classic writer writes nothing at all.
+    let none = kafkaprim.write_tagged_fields(kafkaprim.writer(KafkaClassic), jumbled)
+    test.assert(kafkaprim.written(none) == 0)
+
+// ── kafkarecords: the batch's own refusals and the handed-in codecs ──
+
+// A codec that does nothing, for the shape of the call rather than for
+// its behaviour.
+fn passthrough_codec(b: Bytes) -> Result<Bytes, Str>
+    Ok(bytes.clone(b))
+
+// A codec that fails, so that a codec's own error text travels.
+fn broken_codec(b: Bytes) -> Result<Bytes, Str>
+    Err("the codec refused")
+
+// A control batch's marker: a version and a type in the key, a
+// version and the writer's coordinator epoch in the value.
+fn a_control_batch(type_id: Int) -> kafkarecords.KafkaRecordBatch
+    var b = kafkarecords.batch(0, 1735689600000)
+    let key = bytes.concat([bytes.u16_be(0), bytes.u16_be(type_id)])
+    let value = bytes.concat([bytes.u16_be(0), bytes.u32_be(7)])
+    var r = kafkarecords.record(key, value)
+    r = kafkarecords.record_at(r, 1735689600000)
+    b = kafkarecords.append(b, r)
+    let control = kafkarecords.attributes_of_bits(32)!
+    kafkarecords.with_attributes(b, control)
+
+@test
+fn test_a_batch_is_refused_before_a_byte_of_it_is_believed() [io]
+    let set = kafkarecords.no_codecs()
+    let b = a_batch()
+    let raw = kafkarecords.encode_batch(b, set)!
+
+    test.case("a buffer too short to hold a batch's header is truncation")
+    match kafkarecords.batch_crc(bytes.zeros(4))
+        Ok(_)  => test.fail("four bytes do not hold a header")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+
+    test.case("and so is a declared length longer than the bytes beside it")
+    var short = bytes.zeros(12)
+    bytes.set_u32_be(short, 8, 1000)
+    match kafkarecords.batch_crc(short)
+        Ok(_)  => test.fail("the batch declares a thousand bytes and holds none")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+
+    test.case("a magic byte that is not 2 is a message set this package does not read")
+    var magic = kafkarecords.encode_batch(b, set)!
+    bytes.set_u8(magic, 16, 1)
+    match kafkarecords.decode_batch(magic, 0, set)
+        Ok(_)  => test.fail("magic 1 is a pre-0.11 message set")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "bad_magic")
+
+    test.case("a byte inside the covered range that no longer matches is a bad checksum")
+    var corrupt = kafkarecords.encode_batch(b, set)!
+    bytes.set_u8(corrupt, 40, 0xFF)
+    match kafkarecords.decode_batch(corrupt, 0, set)
+        Ok(_)  => test.fail("the checksum covers everything after its own field")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "bad_crc")
+
+    test.case("a record count of `-1` is a null where the protocol allows none")
+    var negative = kafkarecords.encode_batch(b, set)!
+    bytes.set_u32_be(negative, 57, -1)
+    let fixed = kafkarecords.batch_crc(negative)!
+    bytes.set_u32_be(negative, 17, fixed)
+    match kafkarecords.decode_batch(negative, 0, set)
+        Ok(_)  => test.fail("a record count is not nullable")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "null_not_allowed")
+
+    test.case("a count larger than the records present is a count mismatch")
+    var inflated = kafkarecords.encode_batch(b, set)!
+    bytes.set_u32_be(inflated, 57, 5)
+    let sum = kafkarecords.batch_crc(inflated)!
+    bytes.set_u32_be(inflated, 17, sum)
+    match kafkarecords.decode_batch(inflated, 0, set)
+        Ok(_)  => test.fail("the batch holds two records and says five")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "record_count_mismatch")
+
+    test.case("a trailing partial batch is dropped rather than refused")
+    // A broker truncates a fetch response at the fetch's byte limit,
+    // not at a batch boundary.
+    let whole = kafkarecords.encode_batch(b, set)!
+    let partial = bytes.slice(whole, 0, 20)
+    let joined = bytes.concat([whole, partial])
+    match kafkarecords.decode_batches(joined, set)
+        Ok(bs) => test.assert(list.len(bs) == 1)
+        Err(_) => test.fail("a trailing partial batch is not corruption")
+
+    test.case("`verify_crc` names the two numbers when they differ")
+    match kafkarecords.verify_crc(bytes.zeros(4))
+        Ok(_)  => test.fail("four bytes hold no checksum")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+    match kafkarecords.verify_crc(raw)
+        Ok(ok) => test.assert(ok)
+        Err(_) => test.fail("a freshly encoded batch verifies")
+
+@test
+fn test_a_control_batch_says_which_marker_it_carries() [io]
+    test.case("a marker's key and value hold a version, a type and an epoch")
+    let commit = a_control_batch(1)
+    test.assert(kafkarecords.is_control_batch(commit))
+    match kafkarecords.control_of(commit)
+        Ok(c)  =>
+            test.assert(c.coordinator_epoch == 7)
+            match c.control_type
+                KafkaControlCommit => test.assert(true)
+                _                  => test.fail("type 1 is a commit")
+        Err(_) => test.fail("a marker with a version and an epoch reads")
+
+    test.case("and an abort, and a type no release names")
+    match kafkarecords.control_of(a_control_batch(0))
+        Ok(c)  =>
+            match c.control_type
+                KafkaControlAbort => test.assert(true)
+                _                 => test.fail("type 0 is an abort")
+        Err(_) => test.fail("type 0 is a marker this package names")
+    match kafkarecords.control_of(a_control_batch(9))
+        Ok(c)  =>
+            match c.control_type
+                KafkaControlUnknown(n) => test.assert(n == 9)
+                _                      => test.fail("type 9 is not a type any release names")
+        Err(_) => test.fail("an unknown marker is carried, not refused")
+
+    test.case("a data batch is not a marker, and `control_of` says so")
+    match kafkarecords.control_of(a_batch())
+        Ok(_)  => test.fail("a batch of records carries application data")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "not_encodable")
+
+    test.case("a marker with no record, or a key that is too short, is refused")
+    let empty = kafkarecords.batch(0, 0)
+    let control = kafkarecords.attributes_of_bits(32)!
+    let no_records = kafkarecords.with_attributes(empty, control)
+    match kafkarecords.control_of(no_records)
+        Ok(_)  => test.fail("a marker is one record")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "record_count_mismatch")
+    var short_key = kafkarecords.batch(0, 0)
+    let stub = kafkarecords.record(bytes.from_str("ab"), bytes.from_str("cdefgh"))
+    short_key = kafkarecords.append(short_key, stub)
+    let keyed = kafkarecords.with_attributes(short_key, control)
+    match kafkarecords.control_of(keyed)
+        Ok(_)  => test.fail("a marker's key is a version and a type")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+    var short_value = kafkarecords.batch(0, 0)
+    let tiny = kafkarecords.record(bytes.from_str("abcd"), bytes.from_str("ef"))
+    short_value = kafkarecords.append(short_value, tiny)
+    let valued = kafkarecords.with_attributes(short_value, control)
+    match kafkarecords.control_of(valued)
+        Ok(_)  => test.fail("a marker's value is a version and an epoch")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "truncated")
+
+@test
+fn test_a_batch_goes_through_the_codec_its_attributes_name() [io]
+    let identity = KafkaCodec { compress: passthrough_codec, decompress: passthrough_codec }
+    let broken = KafkaCodec { compress: broken_codec, decompress: broken_codec }
+
+    test.case("a slot is filled per codec, and `none` has no slot to fill")
+    var full = kafkarecords.no_codecs()
+    full = kafkarecords.with_codec(full, KafkaGzip, identity)!
+    full = kafkarecords.with_codec(full, KafkaSnappy, identity)!
+    full = kafkarecords.with_codec(full, KafkaLz4, identity)!
+    full = kafkarecords.with_codec(full, KafkaZstd, identity)!
+    test.assert(list.len(kafkarecords.available_compressions(full)) == 5)
+    match kafkarecords.codec_for(full, KafkaNoCompression)
+        Some(_) => test.fail("`none` is not a codec, so it has no function")
+        None    => test.assert(true)
+
+    test.case("a batch declaring a codec the set does not hold is refused by name")
+    let gzipped = kafkarecords.with_compression(kafkarecords.plain_attributes(), KafkaGzip)
+    let declaring = kafkarecords.with_attributes(a_batch(), gzipped)
+    match kafkarecords.encode_batch(declaring, kafkarecords.no_codecs())
+        Ok(_)  => test.fail("a gzip batch with no gzip codec is not an uncompressed batch")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "compression_not_supplied")
+
+    test.case("and a codec's own failure travels with the codec's own text")
+    let broken_gz = kafkarecords.with_codec(kafkarecords.no_codecs(), KafkaGzip, broken)!
+    match kafkarecords.encode_batch(declaring, broken_gz)
+        Ok(_)  => test.fail("the codec answered an error")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "codec_failed")
+
+    test.case("a batch that went through a codec comes back through it")
+    let gz = kafkarecords.with_codec(kafkarecords.no_codecs(), KafkaGzip, identity)!
+    let packed = kafkarecords.encode_batch(declaring, gz)!
+    match kafkarecords.decode_batch(packed, 0, gz)
+        Ok(read) => test.assert(list.len(read.batch.records) == 2)
+        Err(_)   => test.fail("what this package wrote it reads")
+    match kafkarecords.decode_batch(packed, 0, kafkarecords.no_codecs())
+        Ok(_)  => test.fail("decoding needs the codec too, by name")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "compression_not_supplied")
+    match kafkarecords.decode_batch(packed, 0, kafkarecords.with_codec(kafkarecords.no_codecs(), KafkaGzip, broken)!)
+        Ok(_)  => test.fail("the decompressor answered an error")
+        Err(f) => test.assert(kafkaerror.fault_code(f) == "codec_failed")
+
+    test.case("the codec numbers, names and bits are one table in four spellings")
+    test.assert(kafkarecords.compression_id(KafkaSnappy) == 2)
+    test.assert(kafkarecords.compression_name(KafkaNoCompression) == "none")
+    test.assert(kafkarecords.compression_name(KafkaGzip) == "gzip")
+    test.assert(kafkarecords.compression_name(KafkaSnappy) == "snappy")
+    test.assert(kafkarecords.compression_name(KafkaLz4) == "lz4")
+    test.assert(kafkarecords.compression_name(KafkaZstd) == "zstd")
+    var id = 0
+    while id <= 4
+        let c = kafkarecords.compression_of_id(id)!
+        test.assert(kafkarecords.compression_id(c) == id)
+        match kafkarecords.compression_named(kafkarecords.compression_name(c))
+            Some(back) => test.assert(kafkarecords.compression_id(back) == id)
+            None       => test.fail("every name this package writes it reads")
+        id = id + 1
+
+    test.case("every attribute bit is carried rather than checked")
+    var bit = 8
+    while bit <= 64
+        let attrs = kafkarecords.attributes_of_bits(bit)!
+        test.assert(kafkarecords.attributes_bits(attrs) == bit)
+        bit = bit * 2
+
+    test.case("a log-append-time batch answers the batch's own max timestamp")
+    // `record_at` stamps a record with the instant itself and `append`
+    // turns it into a delta from the batch's base timestamp, so the
+    // record INSIDE the batch is the one a reader holds.
+    var plain_batch = kafkarecords.batch(100, 1735689600000)
+    let first = kafkarecords.record_at(kafkarecords.record(bytes.from_str("k"), bytes.from_str("v")),
+                                       1735689600005)
+    let second = kafkarecords.record_at(kafkarecords.record(bytes.from_str("k2"), bytes.from_str("v2")),
+                                        1735689600010)
+    plain_batch = kafkarecords.append(plain_batch, first)
+    plain_batch = kafkarecords.append(plain_batch, second)
+    let inside = plain_batch.records[0]
+    test.assert(kafkarecords.absolute_timestamp(plain_batch, inside) == 1735689600005)
+    let append_time = kafkarecords.attributes_of_bits(8)!
+    let late = kafkarecords.with_attributes(plain_batch, append_time)
+    test.assert(late.max_timestamp == 1735689600010)
+    // Under log-append time every record answers the batch's own max
+    // timestamp, where adding the delta would have said `...005`.
+    test.assert(kafkarecords.absolute_timestamp(late, inside) == 1735689600010)

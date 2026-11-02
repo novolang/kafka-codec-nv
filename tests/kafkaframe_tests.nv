@@ -1,10 +1,9 @@
 // kafkaframe_tests.nv — the API suite for the state machine: requests
 // in, bytes out, bytes in, responses out.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// kafka-codec-nv.kafkaframe.<fn>`.  What is asserted is that a partial
-// read is not an error, that a produce with `acks = 0` is never queued,
-// and that the pending table is what makes a response decodable at all.
+// What is asserted is that a partial read is not an error, that a
+// produce with `acks = 0` is never queued, and that the pending table
+// is what makes a response decodable at all.
 
 use std.test
 use kafkaframe

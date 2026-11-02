@@ -5,6 +5,92 @@ All notable changes to kafka-codec-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## Unreleased
+
+### Fixed
+
+- A compact length or count whose varint sets the sign bit is refused instead of overflowing the subtraction of one.
+
+## [0.1.0] — 2026-10-11
+
+**The implementation.** Every `todo()` under `src/` is a body, and
+every public signature the 0.0.1 interface published is unchanged.
+Every instrumented line under `src/` is covered by a suite — there is no
+`// cov: skip` marker anywhere, and no line needed one. `novo test` is
+green on all seven suites (62 tests), `novo doc` compiles all 75
+examples, and `novo.lint` reports zero warnings over the eight modules
+and the seven suites.
+
+### Added
+
+- The eight modules implemented at the versions, flexible floors and
+  header versions the 0.0.1 tables published, and nowhere else: the
+  eleven request encoders and response decoders, the two wire spellings
+  carried on the cursor and on the writer, the v2 record batch with its
+  CRC-32C over everything after the checksum field, the fifty-six named
+  broker error codes with their three predicates and the sixteen codec
+  faults, and the framing state machine whose correlation table is what
+  makes a response decodable at all.
+- `tests/kafka_matrix_tests.nv` — the version matrix the 0.0.1 entry
+  recorded as missing. Every API key at every version this release
+  supports, in both directions, so that each `if version >= n` in
+  `kafkareq` and `kafkaresp` is taken rather than argued about, with
+  the published tables — version ranges, flexible floors, header
+  versions, error-code numbers, compression ids — checked against the
+  encoders and decoders that read them.
+- `tests/kafka_codec_edge_tests.nv` — the two places a Kafka codec is
+  silently wrong rather than loud, pinned where the five API suites
+  leave them open: the three spellings of a length, where a classic
+  `-1` is null and anything below it is malformed, and the byte range a
+  batch's CRC-32C covers, pinned against CRC-32C computed in the test
+  from the standard check value. It also takes the arms the five suites
+  never take — a broker floor above this package's, the versions the
+  three entry points refuse, a Produce v8 reply's per-record errors,
+  and the null a fetch reply writes for a partition with nothing to
+  send — so none of them needed a marker.
+
+### Changed
+
+- `kafkarecords.compress_blob` and `decompress_blob` reach the caller's
+  codec through a private helper apiece, `call_compress` and
+  `call_decompress`, instead of calling through the `KafkaCodecSet`
+  slot under their own `match`. The shape is a workaround for a defect
+  in novo 0.20.2, not a design — see `### Known`. Both public
+  signatures are unchanged, and the helpers fold back into their
+  callers when the filing is fixed.
+- The doc comment on `kafkaerror.is_authorization_failure` said four
+  `*_AUTHORIZATION_FAILED` codes; the enum names three. It says three.
+
+### Known
+
+- **A `match` that rebuilds the `Result` of a call through a fn-typed
+  struct field leaks one cell per call on novo 0.20.2** — every verdict
+  green and `the run leaked`, exit 23 — and the two codec helpers above
+  exist for it. Measured with nothing else changed: the same call
+  PASSED STRAIGHT THROUGH is clean, and a `Str`, `[Int]`, `?Int`, enum
+  or struct answer is clean; only the rebuilt `Result` leaks. Filed as
+  `memory-perceus/a-match-that-rebuilds-the-result-of-a-call-through-a-fn-typed-struct-field-leaks`,
+  with a one-file reduction. Every suite is leak-free on 0.20.2 with
+  the helpers in place, on both the codec's success path and its
+  failure path.
+- **`Fetch`'s flexible floor is v12 and this release's `Fetch` stops at
+  v11.** No Fetch message here uses the KIP-482 spelling, so a broker
+  that will not speak v11 or below is refused by negotiation rather
+  than guessed at, and the compact arm of
+  `kafkaprim.write_null_bytes` has no caller inside the package — the
+  edge suite pins it directly. The other ten APIs each include their
+  flexible floor.
+- **There are still no captured frames.** The version matrix runs
+  against frames this package encoded and against buffers built by hand
+  in the edge suite. A codec that has only ever been checked against
+  its own idea of the wire is a codec that can be consistently wrong,
+  and a capture of a real broker's bytes is what the 0.0.1 entry said
+  to add next; it is still what this package wants.
+- The 0.0.1 entry's exclusions stand unchanged: no SASL, no
+  transactions, no administration, no pre-0.11 message sets, and the
+  twenty-two API keys named in the README's "What is not included" are
+  still typed refusals rather than silent skips.
+
 ## [0.0.1] — 2026-09-17
 
 **The interface, published before anyone implements it.** Every public

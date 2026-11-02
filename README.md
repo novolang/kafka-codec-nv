@@ -9,12 +9,6 @@ return values. The client that owns the sockets is
 [kafka-nv](https://novo-lang.org/packages/kafka-nv), which is built on
 this package.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is
-declared with its full signature, but every body is a `todo()` that
-panics when called. The package is published so its design can be
-reviewed and depended on before it is implemented. Version 0.1.0 will
-be the first working release.
-
 ## What the protocol is
 
 A Kafka connection carries **requests** from the client and
@@ -118,10 +112,9 @@ fn main() [io]
                 Ok(d)  => println("${list.len(d.answers)} responses")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: kafka-codec-nv.<module>.<fn>` panic. The tests are
-the specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`. The suites state
+what each function answers; where this release falls short of the
+protocol, the CHANGELOG says so under `### Known`.
 
 ## What the package contains
 
@@ -306,8 +299,7 @@ and the same compact strings.
 
 ## Tests
 
-The suites are written against the signatures and are red until the
-bodies land. `kafkaprim_tests` asserts that the wire style is carried
+`kafkaprim_tests` asserts that the wire style is carried
 by the cursor and that null and empty stay distinct. `kafkaapi_tests`
 asserts the version table, the `ApiVersions` header exception, and that
 an unknown API key is refused while an unknown error code is not.
@@ -317,24 +309,21 @@ read is not an error and that a produce with `acks = 0` is never
 queued. `kafkacover_tests` states what every remaining public function
 answers.
 
-There are no captured frames in the suite yet. The implementation
-should add them: the Kafka distribution's own
+Two suites beside those pin what the five leave open.
+`kafka_codec_edge_tests` pins the two places a Kafka codec is silently
+wrong rather than loud — the three spellings of a length, where a
+classic `-1` is null and anything below it is malformed, and the byte
+range a batch's CRC-32C covers — along with the arms the five never
+take. `kafka_matrix_tests` is the version matrix: every API key at
+every version this release supports, in both directions, so that each
+`if version >= n` in the encoders and decoders is run rather than
+argued about.
+
+There are no captured frames in the suite yet. They are what this
+package wants next: the Kafka distribution's own
 `clients/src/test/resources` and a packet capture of a broker handshake
 are both usable as fixtures, and a version matrix is the one thing a
 protocol codec cannot be trusted on without them.
-
-## Implementation status
-
-| Module | Status |
-| --- | --- |
-| `kafkaerror` | Declared. Every body is a `todo()`. |
-| `kafkaprim` | Declared. Every body is a `todo()`. |
-| `kafkaapi` | Declared. Every body is a `todo()`. |
-| `kafkahdr` | Declared. Every body is a `todo()`. |
-| `kafkarecords` | Declared. Every body is a `todo()`. |
-| `kafkareq` | Declared. Every body is a `todo()`. |
-| `kafkaresp` | Declared. Every body is a `todo()`. |
-| `kafkaframe` | Declared. Every body is a `todo()`. |
 
 ## Licence
 

@@ -1,15 +1,10 @@
 [package]
 name        = "kafka-codec-nv"
-version     = "0.0.1"
-description = "The Apache Kafka wire protocol as a codec that performs nothing: request and response encodings by API key and version for the eleven APIs a client needs to produce, fetch and belong to a consumer group, the KIP-482 flexible spelling with compact strings and tagged fields, v2 record batches with CRC-32C and a compression codec handed in as a value, and size-prefixed framing over a correlation table.  No socket.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "The Apache Kafka wire protocol as a codec that performs nothing: request and response encodings by API key and version for the eleven APIs a client needs to produce, fetch and belong to a consumer group, the KIP-482 flexible spelling with compact strings and tagged fields, v2 record batches with CRC-32C and a compression codec handed in as a value, and size-prefixed framing over a correlation table.  No socket."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+stability   = "experimental"
 
 # `core`, and this one is core all the way down: not one of the eight
 # modules declares an effect row.
@@ -48,7 +43,7 @@ category    = "networking"
 tags        = ["kafka", "wire-protocol", "record-batch", "kip-482", "varint", "crc32c", "codec", "sans-io", "native-port"]
 repository  = "https://github.com/novolang/kafka-codec-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.9.0"
+novo        = ">= 0.20.2"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

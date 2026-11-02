@@ -1,11 +1,10 @@
 // kafkaapi_tests.nv — the API suite for the version table and the one
 // refusal the package makes on purpose.
 //
-// RED ON PURPOSE: every assertion reaches `not implemented:
-// kafka-codec-nv.kafkaapi.<fn>`.  What is asserted is that an unknown
-// API key is refused while an unknown error code is not, that every
-// key's flexible floor is its own, and that the `ApiVersions` response
-// header is the exception the whole package has to know about.
+// What is asserted is that an unknown API key is refused while an
+// unknown error code is not, that every key's flexible floor is its
+// own, and that the `ApiVersions` response header is the exception the
+// whole package has to know about.
 
 use std.test
 use kafkaapi

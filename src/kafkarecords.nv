@@ -2,8 +2,6 @@
 // attribute bits, the varint-encoded records inside, and the control
 // batches that carry no data at all.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // A RECORD BATCH IS THE UNIT KAFKA STORES, NOT A RECORD.  A producer
 // sends a batch, the broker appends the batch, a consumer fetches
 // whole batches and unpacks them.  Everything inside one is relative
@@ -61,8 +59,298 @@
 // `is_control_batch` is the check, and it is public because a caller
 // that assembles its own fetch loop needs it.
 
+use crc
 use kafkaerror
 use kafkaprim
+
+// The batch's fixed layout, byte by byte, and the three offsets the
+// checksum turns on: the CRC field's own offset, the first byte the
+// checksum covers, and the record count that ends the fixed header.
+// An implementation that gets the covered range wrong is wrong by
+// exactly the four bytes of the field it miscounted — which is why
+// `crc_start` is named rather than written as a `+ 4` somewhere.
+
+// The offset of the CRC-32C field: the base offset (`8`), the batch
+// length (`4`), the leader epoch (`4`) and the magic (`1`).
+fn crc_offset() -> Int
+    17
+
+// The first byte the checksum covers — everything after the CRC field
+// to the end of the batch, the compressed records included.  NOT the
+// whole batch, and NOT the uncompressed records: see the module
+// comment.
+fn crc_start() -> Int
+    21
+
+// The offset of the record count, which is also where the fixed header
+// ends.
+fn records_offset() -> Int
+    57
+
+// The batch's size as its own length field declares it, checked
+// against the bytes that are actually there.
+//
+// `at` is where the batch starts, so a fetch response holding several
+// batches back to back is walked at absolute offsets.
+fn batch_span(raw: Bytes, at: Int) -> Result<Int, kafkaerror.KafkaFault>
+    let left = bytes.len(raw) - at
+    if left < 12
+        return Err(kafkaerror.KafkaTruncated(bytes.len(raw), 12 - left, "a record batch's header"))
+    let declared = bytes.u32_be_at(raw, at + 8) ?? 0
+    let span = 12 + declared
+    if span > left
+        return Err(kafkaerror.KafkaTruncated(bytes.len(raw), span - left, "a record batch"))
+    Ok(span)
+
+// Whether a whole batch starts at `at`.
+//
+// False means the bytes stop in the middle of one, which is what a
+// fetch response's last batch looks like when the broker truncated the
+// set at the fetch's byte limit.  See `decode_batches`.
+fn whole_batch_at(raw: Bytes, at: Int) -> Bool
+    let left = bytes.len(raw) - at
+    if left < 12
+        return false
+    let declared = bytes.u32_be_at(raw, at + 8) ?? 0
+    let span = 12 + declared
+    span <= left
+
+// The CRC-32C of a buffer: crc-nv's Castagnoli table, reflected, which
+// is the algorithm the protocol names.  Not `crc32`, which is the
+// polynomial zip and PNG use and which a broker refuses.
+fn crc32c_of(src: Bytes) -> Int
+    let algo = crc.crc32c()
+    algo.checksum(src)
+
+// A length one of a record's own fields carries: a zigzag varint,
+// where `-1` means null and anything below it is malformed.
+fn read_record_len(c: kafkaprim.KafkaCursor,
+                   field: Str) -> Result<kafkaprim.KafkaIntRead, kafkaerror.KafkaFault>
+    let r = kafkaprim.read_varint(c)!
+    if r.value < -1
+        return Err(kafkaerror.KafkaNullNotAllowed(c.offset, field))
+    Ok(r)
+
+// The same, for a length that may not be null at all.
+fn read_required_len(c: kafkaprim.KafkaCursor,
+                     field: Str) -> Result<kafkaprim.KafkaIntRead, kafkaerror.KafkaFault>
+    let r = read_record_len(c, field)!
+    if r.value < 0
+        return Err(kafkaerror.KafkaNullNotAllowed(c.offset, field))
+    Ok(r)
+
+// A record's byte string, and the cursor after it.
+struct KafkaFieldRead
+    value: Bytes
+    // Whether the wire said null rather than empty.  For a key and a
+    // value the difference is a tombstone and a message — see the
+    // module comment.
+    is_null: Bool
+    cursor: kafkaprim.KafkaCursor
+
+fn read_record_bytes(c: kafkaprim.KafkaCursor,
+                     field: Str) -> Result<KafkaFieldRead, kafkaerror.KafkaFault>
+    let r = read_record_len(c, field)!
+    if r.value == -1
+        return Ok(KafkaFieldRead { value: bytes.zeros(0), is_null: true, cursor: r.cursor })
+    let raw = kafkaprim.read_raw(r.cursor, r.value)!
+    Ok(KafkaFieldRead { value: raw.value, is_null: false, cursor: raw.cursor })
+
+// One record header, and the cursor after it.
+struct KafkaHeaderRead
+    header: KafkaRecordHeader
+    cursor: kafkaprim.KafkaCursor
+
+// One record header: a name, which is never null, and a value, which
+// may be — a null value reads as empty bytes, because
+// `KafkaRecordHeader` has one field for it.
+fn read_header(c: kafkaprim.KafkaCursor) -> Result<KafkaHeaderRead, kafkaerror.KafkaFault>
+    let name_r = read_required_len(c, "record header key")!
+    let name_raw = kafkaprim.read_raw(name_r.cursor, name_r.value)!
+    let name_bytes = name_raw.value
+    let after_name = name_raw.cursor
+    let name_text = bytes.to_str(name_bytes)
+    let val_r = read_record_bytes(after_name, "record header value")!
+    Ok(KafkaHeaderRead { header: KafkaRecordHeader { key: name_text, value: val_r.value },
+                         cursor: val_r.cursor })
+
+// One record, and the cursor after its bytes.
+struct KafkaRecordRead
+    record: KafkaRecord
+    cursor: kafkaprim.KafkaCursor
+
+// One record from a batch's record bytes.
+//
+// THE RECORD'S OWN FIELDS ARE VARINTS WHATEVER THE MESSAGE'S WIRE
+// STYLE IS.  The KIP-482 conversion stopped at the batch's edge: a
+// record's lengths are zigzag varints in every version, so nothing
+// here goes through the classic/flexible split and
+// `kafkaprim.read_bytes` — which would read a four-byte length — is
+// not the reader for them.
+fn read_record(c: kafkaprim.KafkaCursor) -> Result<KafkaRecordRead, kafkaerror.KafkaFault>
+    let start = c.offset
+    let len_r = read_required_len(c, "record length")!
+    let rec_len = len_r.value
+    let after_len = len_r.cursor
+    let attrs_r = kafkaprim.read_int8(after_len)!
+    let ts_r = kafkaprim.read_varlong(attrs_r.cursor)!
+    let off_r = kafkaprim.read_varint(ts_r.cursor)!
+    let key_r = read_record_bytes(off_r.cursor, "record key")!
+    let val_r = read_record_bytes(key_r.cursor, "record value")!
+    let count_r = read_required_len(val_r.cursor, "record header count")!
+    var headers: [KafkaRecordHeader] = []
+    var cur = count_r.cursor
+    var i = 0
+    while i < count_r.value
+        let h = read_header(cur)!
+        headers = list.push(headers, h.header)
+        cur = h.cursor
+        i += 1
+    let record = KafkaRecord { attributes: attrs_r.value, timestamp_delta: ts_r.value,
+                               offset_delta: off_r.value, key: key_r.value,
+                               key_is_null: key_r.is_null, value: val_r.value,
+                               value_is_null: val_r.is_null, headers: headers }
+    // The declared length, not the parse, says where the next record
+    // starts: it is there so a reader that does not know a field can
+    // still skip the record.
+    let end = start + kafkaprim.varint_size(rec_len) + rec_len
+    Ok(KafkaRecordRead { record: record, cursor: kafkaprim.at(cur, end) })
+
+// `n` records from a batch's decompressed record bytes.
+fn read_records(plain: Bytes, n: Int) -> Result<[KafkaRecord], kafkaerror.KafkaFault>
+    var out: [KafkaRecord] = []
+    var cur = kafkaprim.cursor(plain, kafkaprim.KafkaClassic)
+    var i = 0
+    while i < n
+        if kafkaprim.at_end(cur)
+            return Err(kafkaerror.KafkaRecordCountMismatch(n, i))
+        let r = read_record(cur)!
+        out = list.push(out, r.record)
+        cur = r.cursor
+        i += 1
+    Ok(out)
+
+// The bytes a varint length prefix covers, the prefix included: a
+// negative length is null and covers no bytes of its own.
+fn length_and_bytes(n: Int) -> Int
+    if n < 0
+        kafkaprim.varint_size(n)
+    else
+        kafkaprim.varint_size(n) + n
+
+// The length a record writes for a field: `-1` when it is null.
+fn field_length(b: Bytes, is_null: Bool) -> Int
+    if is_null
+        return -1
+    bytes.len(b)
+
+// The bytes one record occupies once encoded, its varint length prefix
+// not included.
+fn record_body_size(r: KafkaRecord) -> Int
+    var n = 1
+    n += kafkaprim.varint_size(r.timestamp_delta)
+    n += kafkaprim.varint_size(r.offset_delta)
+    n += length_and_bytes(field_length(r.key, r.key_is_null))
+    n += length_and_bytes(field_length(r.value, r.value_is_null))
+    n += kafkaprim.varint_size(list.len(r.headers))
+    for h in r.headers
+        n += kafkaprim.varint_size(str.len(h.key))
+        n += str.len(h.key)
+        n += length_and_bytes(bytes.len(h.value))
+    n
+
+// A record's byte string: the varint length, `-1` for null, then the
+// bytes.
+fn write_record_field(w: kafkaprim.KafkaWriter, b: Bytes, is_null: Bool) -> kafkaprim.KafkaWriter
+    if is_null
+        return kafkaprim.write_varint(w, -1)
+    var out = kafkaprim.write_varint(w, bytes.len(b))
+    out = kafkaprim.write_raw(out, b)
+    out
+
+// One record header: a name, never null, and a value.  A null value
+// comes back as an empty one, because `KafkaRecordHeader` has one
+// field for it.
+fn write_record_header(w: kafkaprim.KafkaWriter, h: KafkaRecordHeader) -> kafkaprim.KafkaWriter
+    var out = kafkaprim.write_varint(w, str.len(h.key))
+    out = kafkaprim.write_raw(out, bytes.from_str(h.key))
+    out = kafkaprim.write_varint(out, bytes.len(h.value))
+    out = kafkaprim.write_raw(out, h.value)
+    out
+
+// The control marker a number denotes.
+fn control_type_of(n: Int) -> KafkaControlType
+    match n
+        0 => KafkaControlAbort
+        1 => KafkaControlCommit
+        _ => KafkaControlUnknown(n)
+
+// Whether the set holds a function for this codec.
+fn has_codec(set: KafkaCodecSet, c: KafkaCompression) -> Bool
+    match codec_for(set, c)
+        Some(_) => true
+        None    => false
+
+// A batch's record bytes as they go on the wire: the records encoded,
+// then the declared codec applied.
+fn records_blob(b: KafkaRecordBatch, set: KafkaCodecSet) -> Result<Bytes, kafkaerror.KafkaFault>
+    var w = kafkaprim.writer(kafkaprim.KafkaClassic)
+    for r in b.records
+        w = encode_record(b, r, w)!
+    let plain = kafkaprim.finish(w)
+    compress_blob(b.attributes.compression, plain, set)
+
+// The codec's own compress call, kept out of `compress_blob`.
+//
+// On 0.20.2 a call through a fn-typed struct field whose answer is
+// MATCHED IN THE SAME FUNCTION leaks one cell per call: every verdict
+// is green and the process exits 23
+// [memory-perceus/a-match-that-rebuilds-the-result-of-a-call-through-a-fn-typed-struct-field-leaks].
+// Answering the call whole is clean, which is what these two are for:
+// `compress_blob` keeps its match and its `KafkaCodecFailed`, and the
+// codec's answer travels through a plain parameter instead.  Measured
+// clean on both the codec's success path and its failure path.  When
+// the filing is fixed these can fold back into their callers.
+fn call_compress(codec: KafkaCodec, plain: Bytes) -> Result<Bytes, Str>
+    let compress = codec.compress
+    compress(plain)
+
+// The codec's own decompress call, for the reason `call_compress`
+// records.
+fn call_decompress(codec: KafkaCodec, packed: Bytes) -> Result<Bytes, Str>
+    let decompress = codec.decompress
+    decompress(packed)
+
+// `plain` in the codec's bytes, or the refusal that names the codec.
+//
+// A batch whose codec the set does not hold is
+// `kafkaerror.KafkaCompressionNotSupplied` — not an empty batch and
+// not a skip.  See the module comment.
+fn compress_blob(c: KafkaCompression, plain: Bytes,
+                 set: KafkaCodecSet) -> Result<Bytes, kafkaerror.KafkaFault>
+    if not needs_codec(c)
+        // A copy, because a plain return cannot hand back a buffer
+        // reachable from the plain parameter `plain` [E2038].
+        return Ok(bytes.clone(plain))
+    let maybe = codec_for(set, c)
+    let Some(codec) = maybe else return Err(kafkaerror.KafkaCompressionNotSupplied(compression_name(c)))
+    match call_compress(codec, plain)
+        Ok(out)  => Ok(out)
+        Err(msg) => Err(kafkaerror.KafkaCodecFailed(compression_name(c), msg))
+
+// The bytes a batch's records decompress to, or the refusal that names
+// the codec — for reading a batch, the same three answers as
+// `compress_blob`.
+fn decompress_blob(c: KafkaCompression, packed: Bytes,
+                   set: KafkaCodecSet) -> Result<Bytes, kafkaerror.KafkaFault>
+    if not needs_codec(c)
+        // A copy, for the reason `compress_blob` makes one [E2038].
+        return Ok(bytes.clone(packed))
+    let maybe = codec_for(set, c)
+    let Some(codec) = maybe else return Err(kafkaerror.KafkaCompressionNotSupplied(compression_name(c)))
+    match call_decompress(codec, packed)
+        Ok(out)  => Ok(out)
+        Err(msg) => Err(kafkaerror.KafkaCodecFailed(compression_name(c), msg))
 
 // Which codec a batch's record bytes are in.
 //
@@ -245,7 +533,7 @@ pub struct KafkaBatchRead
 //         None    => println("no gzip — a gzip batch is refused by name")
 // ```
 pub fn no_codecs() -> KafkaCodecSet
-    todo("kafka-codec-nv.kafkarecords.no_codecs")
+    KafkaCodecSet { gzip: None, snappy: None, lz4: None, zstd: None }
 
 // The same set with one codec supplied.
 //
@@ -260,7 +548,19 @@ pub fn no_codecs() -> KafkaCodecSet
 // ```
 pub fn with_codec(set: KafkaCodecSet, c: KafkaCompression,
                   codec: KafkaCodec) -> Result<KafkaCodecSet, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkarecords.with_codec")
+    match c
+        KafkaGzip          => Ok(KafkaCodecSet { gzip: Some(codec), snappy: set.snappy,
+                                          lz4: set.lz4, zstd: set.zstd })
+        KafkaSnappy        => Ok(KafkaCodecSet { gzip: set.gzip, snappy: Some(codec),
+                                          lz4: set.lz4, zstd: set.zstd })
+        KafkaLz4           => Ok(KafkaCodecSet { gzip: set.gzip, snappy: set.snappy,
+                                          lz4: Some(codec), zstd: set.zstd })
+        KafkaZstd          => Ok(KafkaCodecSet { gzip: set.gzip, snappy: set.snappy,
+                                          lz4: set.lz4, zstd: Some(codec) })
+        KafkaNoCompression =>
+            // The codec that is not one needs no function, so there is
+            // no slot to put one in.
+            Err(kafkaerror.KafkaNotEncodable("compression", "`none` needs no codec function and has no slot"))
 
 // The codec for a compression, or `None`.
 //
@@ -268,13 +568,20 @@ pub fn with_codec(set: KafkaCodecSet, c: KafkaCompression,
 // that as "missing" would refuse every uncompressed batch — so the
 // encoders and decoders ask `needs_codec` first.
 pub fn codec_for(set: KafkaCodecSet, c: KafkaCompression) -> ?KafkaCodec
-    todo("kafka-codec-nv.kafkarecords.codec_for")
+    match c
+        KafkaGzip          => set.gzip
+        KafkaSnappy        => set.snappy
+        KafkaLz4           => set.lz4
+        KafkaZstd          => set.zstd
+        KafkaNoCompression => None
 
 // Whether this compression needs a codec function at all.
 //
 // False for `KafkaNoCompression` and true for the other four.
 pub fn needs_codec(c: KafkaCompression) -> Bool
-    todo("kafka-codec-nv.kafkarecords.needs_codec")
+    if c == KafkaNoCompression
+        return false
+    true
 
 // Which compressions the set can handle, including
 // `KafkaNoCompression`.
@@ -282,11 +589,25 @@ pub fn needs_codec(c: KafkaCompression) -> Bool
 // What a producer consults before choosing a codec for a topic, and
 // what a report prints so an operator can see why a partition stalled.
 pub fn available_compressions(set: KafkaCodecSet) -> [KafkaCompression]
-    todo("kafka-codec-nv.kafkarecords.available_compressions")
+    var out: [KafkaCompression] = [KafkaNoCompression]
+    if has_codec(set, KafkaGzip)
+        out = list.push(out, KafkaGzip)
+    if has_codec(set, KafkaSnappy)
+        out = list.push(out, KafkaSnappy)
+    if has_codec(set, KafkaLz4)
+        out = list.push(out, KafkaLz4)
+    if has_codec(set, KafkaZstd)
+        out = list.push(out, KafkaZstd)
+    out
 
 // The number the attributes carry for this compression.
 pub fn compression_id(c: KafkaCompression) -> Int
-    todo("kafka-codec-nv.kafkarecords.compression_id")
+    match c
+        KafkaNoCompression => 0
+        KafkaGzip          => 1
+        KafkaSnappy        => 2
+        KafkaLz4           => 3
+        KafkaZstd          => 4
 
 // The compression a number denotes, or
 // `kafkaerror.KafkaUnknownCompression`.
@@ -296,7 +617,13 @@ pub fn compression_id(c: KafkaCompression) -> Int
 // uncompressed would hand a caller compressed bytes as if they were a
 // message.
 pub fn compression_of_id(n: Int) -> Result<KafkaCompression, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkarecords.compression_of_id")
+    match n
+        0 => Ok(KafkaNoCompression)
+        1 => Ok(KafkaGzip)
+        2 => Ok(KafkaSnappy)
+        3 => Ok(KafkaLz4)
+        4 => Ok(KafkaZstd)
+        _ => Err(kafkaerror.KafkaUnknownCompression(n))
 
 // The name Kafka's own configuration uses: `"none"`, `"gzip"`,
 // `"snappy"`, `"lz4"`, `"zstd"`.
@@ -304,15 +631,39 @@ pub fn compression_of_id(n: Int) -> Result<KafkaCompression, kafkaerror.KafkaFau
 // The same spelling as `compression.type` in a broker or producer
 // configuration file, so a caller can read one and pass it through.
 pub fn compression_name(c: KafkaCompression) -> Str
-    todo("kafka-codec-nv.kafkarecords.compression_name")
+    match c
+        KafkaNoCompression => "none"
+        KafkaGzip          => "gzip"
+        KafkaSnappy        => "snappy"
+        KafkaLz4           => "lz4"
+        KafkaZstd          => "zstd"
 
 // The compression a configuration name denotes, or `None`.
 pub fn compression_named(name: Str) -> ?KafkaCompression
-    todo("kafka-codec-nv.kafkarecords.compression_named")
+    if name == "none"
+        return Some(KafkaNoCompression)
+    if name == "gzip"
+        return Some(KafkaGzip)
+    if name == "snappy"
+        return Some(KafkaSnappy)
+    if name == "lz4"
+        return Some(KafkaLz4)
+    if name == "zstd"
+        return Some(KafkaZstd)
+    None
 
 // The sixteen attribute bits as a number.
 pub fn attributes_bits(a: KafkaBatchAttributes) -> Int
-    todo("kafka-codec-nv.kafkarecords.attributes_bits")
+    var flags = compression_id(a.compression)
+    if a.log_append_time
+        flags = flags | 8
+    if a.is_transactional
+        flags = flags | 16
+    if a.is_control
+        flags = flags | 32
+    if a.has_delete_horizon
+        flags = flags | 64
+    flags
 
 // What a number's attribute bits say.
 //
@@ -320,7 +671,15 @@ pub fn attributes_bits(a: KafkaBatchAttributes) -> Int
 // rather than checked, because a broker that starts using bit 7 must
 // not stop this decoder.
 pub fn attributes_of_bits(n: Int) -> Result<KafkaBatchAttributes, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkarecords.attributes_of_bits")
+    // Only the low three bits are a closed set.  The reserved ones are
+    // carried rather than checked, so a broker that starts using bit 7
+    // does not stop this decoder.
+    let comp = compression_of_id(n & 7)!
+    Ok(KafkaBatchAttributes { compression: comp,
+                              log_append_time: (n & 8) != 0,
+                              is_transactional: (n & 16) != 0,
+                              is_control: (n & 32) != 0,
+                              has_delete_horizon: (n & 64) != 0 })
 
 // Plain attributes: no compression, producer timestamps, not
 // transactional, not a control batch.
@@ -332,11 +691,15 @@ pub fn attributes_of_bits(n: Int) -> Result<KafkaBatchAttributes, kafkaerror.Kaf
 //     println("${kafkarecords.attributes_bits(kafkarecords.plain_attributes())}")   // 0
 // ```
 pub fn plain_attributes() -> KafkaBatchAttributes
-    todo("kafka-codec-nv.kafkarecords.plain_attributes")
+    KafkaBatchAttributes { compression: KafkaNoCompression, log_append_time: false,
+                           is_transactional: false, is_control: false,
+                           has_delete_horizon: false }
 
 // The same attributes with a compression codec declared.
 pub fn with_compression(a: KafkaBatchAttributes, c: KafkaCompression) -> KafkaBatchAttributes
-    todo("kafka-codec-nv.kafkarecords.with_compression")
+    KafkaBatchAttributes { compression: c, log_append_time: a.log_append_time,
+                           is_transactional: a.is_transactional, is_control: a.is_control,
+                           has_delete_horizon: a.has_delete_horizon }
 
 // A record with a key and a value, both present, no headers, and both
 // deltas zero.
@@ -352,7 +715,8 @@ pub fn with_compression(a: KafkaBatchAttributes, c: KafkaCompression) -> KafkaBa
 //     println("${r.offset_delta}")                       // 0
 // ```
 pub fn record(key: Bytes, value: Bytes) -> KafkaRecord
-    todo("kafka-codec-nv.kafkarecords.record")
+    KafkaRecord { attributes: 0, timestamp_delta: 0, offset_delta: 0, key: key,
+                  key_is_null: false, value: value, value_is_null: false, headers: [] }
 
 // A record with no key.
 //
@@ -360,7 +724,9 @@ pub fn record(key: Bytes, value: Bytes) -> KafkaRecord
 // and one with a key by its hash, so which of the two a producer sends
 // decides where the record lands.
 pub fn record_without_key(value: Bytes) -> KafkaRecord
-    todo("kafka-codec-nv.kafkarecords.record_without_key")
+    KafkaRecord { attributes: 0, timestamp_delta: 0, offset_delta: 0,
+                  key: bytes.zeros(0), key_is_null: true, value: value,
+                  value_is_null: false, headers: [] }
 
 // A tombstone: a record with a key and a NULL value.
 //
@@ -378,11 +744,15 @@ pub fn record_without_key(value: Bytes) -> KafkaRecord
 //     println("${t.value_is_null}")                      // true
 // ```
 pub fn tombstone(key: Bytes) -> KafkaRecord
-    todo("kafka-codec-nv.kafkarecords.tombstone")
+    KafkaRecord { attributes: 0, timestamp_delta: 0, offset_delta: 0, key: key,
+                  key_is_null: false, value: bytes.zeros(0), value_is_null: true,
+                  headers: [] }
 
 // The same record with headers attached.
 pub fn with_headers(r: KafkaRecord, headers: [KafkaRecordHeader]) -> KafkaRecord
-    todo("kafka-codec-nv.kafkarecords.with_headers")
+    KafkaRecord { attributes: r.attributes, timestamp_delta: r.timestamp_delta,
+                  offset_delta: r.offset_delta, key: r.key, key_is_null: r.key_is_null,
+                  value: r.value, value_is_null: r.value_is_null, headers: headers }
 
 // The same record stamped at an instant, in milliseconds since the
 // Unix epoch.
@@ -403,7 +773,13 @@ pub fn with_headers(r: KafkaRecord, headers: [KafkaRecordHeader]) -> KafkaRecord
 //     println("${r.timestamp_delta}")
 // ```
 pub fn record_at(r: KafkaRecord, unix_millis: Int) -> KafkaRecord
-    todo("kafka-codec-nv.kafkarecords.record_at")
+    // A record that is not in a batch yet cannot carry a delta from
+    // one, so the field holds the instant itself and `append` turns it
+    // into a delta.  `0` is "no stamp": the record then takes the
+    // batch's own base instant, which is what `record` leaves it as.
+    KafkaRecord { attributes: r.attributes, timestamp_delta: unix_millis,
+                  offset_delta: r.offset_delta, key: r.key, key_is_null: r.key_is_null,
+                  value: r.value, value_is_null: r.value_is_null, headers: r.headers }
 
 // An empty batch at a base offset and a base timestamp.
 //
@@ -415,7 +791,11 @@ pub fn record_at(r: KafkaRecord, unix_millis: Int) -> KafkaRecord
 //     println("${list.len(b.records)}")                  // 0
 // ```
 pub fn batch(base_offset: Int, base_timestamp_millis: Int) -> KafkaRecordBatch
-    todo("kafka-codec-nv.kafkarecords.batch")
+    KafkaRecordBatch { base_offset: base_offset, partition_leader_epoch: -1, magic: 2,
+                       crc: 0, attributes: plain_attributes(), last_offset_delta: -1,
+                       base_timestamp: base_timestamp_millis,
+                       max_timestamp: base_timestamp_millis, producer_id: -1,
+                       producer_epoch: -1, base_sequence: -1, records: [] }
 
 // The same batch with a record on the end.
 //
@@ -435,11 +815,42 @@ pub fn batch(base_offset: Int, base_timestamp_millis: Int) -> KafkaRecordBatch
 //     println("${b.last_offset_delta}")                  // 0
 // ```
 pub fn append(b: KafkaRecordBatch, r: KafkaRecord) -> KafkaRecordBatch
-    todo("kafka-codec-nv.kafkarecords.append")
+    let index = list.len(b.records)
+    // A record stamped by `record_at` carries the instant itself; one
+    // from `record` carries `0`, meaning "the batch's own base
+    // instant".  Either way what goes into the batch is a delta, which
+    // is the only thing a record inside a batch may hold.
+    var delta = r.timestamp_delta
+    if delta != 0
+        delta = delta - b.base_timestamp
+    let stamped = KafkaRecord { attributes: r.attributes, timestamp_delta: delta,
+                                offset_delta: index, key: r.key,
+                                key_is_null: r.key_is_null, value: r.value,
+                                value_is_null: r.value_is_null, headers: r.headers }
+    let at = b.base_timestamp + delta
+    var highest = b.max_timestamp
+    if at > highest
+        highest = at
+    // The records list is cloned before it grows: a list is a
+    // reference, and appending to the caller's own list would change
+    // the batch the caller still holds.
+    let records = list.push(list.clone(b.records), stamped)
+    KafkaRecordBatch { base_offset: b.base_offset,
+                       partition_leader_epoch: b.partition_leader_epoch,
+                       magic: b.magic, crc: b.crc, attributes: b.attributes,
+                       last_offset_delta: index, base_timestamp: b.base_timestamp,
+                       max_timestamp: highest, producer_id: b.producer_id,
+                       producer_epoch: b.producer_epoch, base_sequence: b.base_sequence,
+                       records: records }
 
 // The same batch with attributes.
 pub fn with_attributes(b: KafkaRecordBatch, a: KafkaBatchAttributes) -> KafkaRecordBatch
-    todo("kafka-codec-nv.kafkarecords.with_attributes")
+    KafkaRecordBatch { base_offset: b.base_offset,
+                       partition_leader_epoch: b.partition_leader_epoch, magic: b.magic,
+                       crc: b.crc, attributes: a, last_offset_delta: b.last_offset_delta,
+                       base_timestamp: b.base_timestamp, max_timestamp: b.max_timestamp,
+                       producer_id: b.producer_id, producer_epoch: b.producer_epoch,
+                       base_sequence: b.base_sequence, records: b.records }
 
 // The same batch marked as one idempotent producer's, with its id,
 // epoch and base sequence.
@@ -449,7 +860,13 @@ pub fn with_attributes(b: KafkaRecordBatch, a: KafkaBatchAttributes) -> KafkaRec
 // `kafkaerror.KafkaErrOutOfOrderSequence` is reporting.
 pub fn with_producer(b: KafkaRecordBatch, producer_id: Int, producer_epoch: Int,
                      base_sequence: Int) -> KafkaRecordBatch
-    todo("kafka-codec-nv.kafkarecords.with_producer")
+    KafkaRecordBatch { base_offset: b.base_offset,
+                       partition_leader_epoch: b.partition_leader_epoch, magic: b.magic,
+                       crc: b.crc, attributes: b.attributes,
+                       last_offset_delta: b.last_offset_delta,
+                       base_timestamp: b.base_timestamp, max_timestamp: b.max_timestamp,
+                       producer_id: producer_id, producer_epoch: producer_epoch,
+                       base_sequence: base_sequence, records: b.records }
 
 // Encode a batch: records, then compression, then the header, then the
 // checksum.
@@ -471,7 +888,37 @@ pub fn with_producer(b: KafkaRecordBatch, producer_id: Int, producer_epoch: Int,
 //         Err(_)  => println("refused")
 // ```
 pub fn encode_batch(b: KafkaRecordBatch, set: KafkaCodecSet) -> Result<Bytes, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkarecords.encode_batch")
+    // The order is the design: records, then compression, then the
+    // header, then the checksum.  The checksum is written LAST,
+    // because what it covers does not exist until the compressed
+    // bytes do.
+    let blob = records_blob(b, set)!
+    var w = kafkaprim.writer(kafkaprim.KafkaClassic)
+    w = kafkaprim.write_int64(w, b.base_offset)
+    // The batch length: everything after this field.  `49` is the
+    // fixed tail from the leader epoch to the record count, and the
+    // count field is the last four of them.
+    w = kafkaprim.write_int32(w, 49 + bytes.len(blob))
+    w = kafkaprim.write_int32(w, b.partition_leader_epoch)
+    w = kafkaprim.write_int8(w, b.magic)
+    // A zero where the checksum goes, so the field exists and the
+    // offsets after it are the ones the wire expects.  It is written
+    // over below.
+    w = kafkaprim.write_uint32(w, 0)
+    w = kafkaprim.write_int16(w, attributes_bits(b.attributes))
+    w = kafkaprim.write_int32(w, b.last_offset_delta)
+    w = kafkaprim.write_int64(w, b.base_timestamp)
+    w = kafkaprim.write_int64(w, b.max_timestamp)
+    w = kafkaprim.write_int64(w, b.producer_id)
+    w = kafkaprim.write_int16(w, b.producer_epoch)
+    w = kafkaprim.write_int32(w, b.base_sequence)
+    w = kafkaprim.write_int32(w, list.len(b.records))
+    w = kafkaprim.write_raw(w, blob)
+    var out = kafkaprim.finish(w)
+    let covered = bytes.slice(out, crc_start(), bytes.len(out))
+    let sum = crc32c_of(covered)
+    bytes.set_u32_be(out, crc_offset(), sum)
+    Ok(out)
 
 // How many bytes `encode_batch` would produce.
 //
@@ -481,7 +928,16 @@ pub fn encode_batch(b: KafkaRecordBatch, set: KafkaCodecSet) -> Result<Bytes, ka
 // sizes: the deltas are varints whose width depends on the batch's
 // own base values.
 pub fn batch_size(b: KafkaRecordBatch, set: KafkaCodecSet) -> Result<Int, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkarecords.batch_size")
+    // The records have to be compressed before their size is known, so
+    // this is `records_blob`'s work rather than a sum of record sizes:
+    // what a codec does to the bytes is the codec's answer, not this
+    // module's.
+    let blob = records_blob(b, set)!
+    // Everything before the record bytes: the two length fields, the
+    // leader epoch, the magic, the checksum, the attributes, the last
+    // offset delta, the two timestamps, the producer's three fields
+    // and the record count.
+    Ok(12 + 49 + bytes.len(blob))
 
 // Decode one batch at an offset.
 //
@@ -499,7 +955,49 @@ pub fn batch_size(b: KafkaRecordBatch, set: KafkaCodecSet) -> Result<Int, kafkae
 // ```
 pub fn decode_batch(buf: Bytes, offset: Int,
                     set: KafkaCodecSet) -> Result<KafkaBatchRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkarecords.decode_batch")
+    let head = kafkaprim.cursor(buf, kafkaprim.KafkaClassic)
+    let start = kafkaprim.at(head, offset)
+    let base_r = kafkaprim.read_int64(start)!
+    let len_r = kafkaprim.read_int32(base_r.cursor)!
+    let epoch_r = kafkaprim.read_int32(len_r.cursor)!
+    let magic_r = kafkaprim.read_int8(epoch_r.cursor)!
+    if magic_r.value != 2
+        return Err(kafkaerror.KafkaBadMagic(magic_r.value))
+    // The batch's whole size, before a byte of it is believed.
+    let span = batch_span(buf, offset)!
+    // THE CHECKSUM IS VERIFIED BEFORE ANYTHING INSIDE THE BATCH IS
+    // DECODED, so a corrupt batch is `KafkaBadCrc` rather than a
+    // varint error somewhere in the middle of it.
+    let crc_r = kafkaprim.read_uint32(magic_r.cursor)!
+    let covered = bytes.slice(buf, offset + crc_start(), offset + span)
+    let sum = crc32c_of(covered)
+    if sum != crc_r.value
+        return Err(kafkaerror.KafkaBadCrc(sum, crc_r.value))
+    let attrs_r = kafkaprim.read_int16(crc_r.cursor)!
+    let last_r = kafkaprim.read_int32(attrs_r.cursor)!
+    let base_ts_r = kafkaprim.read_int64(last_r.cursor)!
+    let max_ts_r = kafkaprim.read_int64(base_ts_r.cursor)!
+    let pid_r = kafkaprim.read_int64(max_ts_r.cursor)!
+    let pepoch_r = kafkaprim.read_int16(pid_r.cursor)!
+    let seq_r = kafkaprim.read_int32(pepoch_r.cursor)!
+    let count_r = kafkaprim.read_int32(seq_r.cursor)!
+    if count_r.value < 0
+        return Err(kafkaerror.KafkaNullNotAllowed(count_r.cursor.offset, "record count"))
+    let attributes = attributes_of_bits(attrs_r.value)!
+    var records: [KafkaRecord] = []
+    if count_r.value > 0
+        let packed = bytes.slice(buf, offset + records_offset() + 4, offset + span)
+        let plain = decompress_blob(attributes.compression, packed, set)!
+        records = read_records(plain, count_r.value)!
+    let batch = KafkaRecordBatch { base_offset: base_r.value,
+                                   partition_leader_epoch: epoch_r.value, magic: 2,
+                                   crc: crc_r.value, attributes: attributes,
+                                   last_offset_delta: last_r.value,
+                                   base_timestamp: base_ts_r.value,
+                                   max_timestamp: max_ts_r.value, producer_id: pid_r.value,
+                                   producer_epoch: pepoch_r.value,
+                                   base_sequence: seq_r.value, records: records }
+    Ok(KafkaBatchRead { batch: batch, bytes: span })
 
 // Decode every batch in a fetch response's record set.
 //
@@ -521,14 +1019,32 @@ pub fn decode_batch(buf: Bytes, offset: Int,
 // ```
 pub fn decode_batches(buf: Bytes,
                       set: KafkaCodecSet) -> Result<[KafkaRecordBatch], kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkarecords.decode_batches")
+    var out: [KafkaRecordBatch] = []
+    var at = 0
+    // The loop stops at a batch that is not all there instead of
+    // refusing it: a fetch response is truncated at the fetch's byte
+    // limit and not at a batch boundary, and a consumer that treated
+    // the remainder as corruption would stall on every partition whose
+    // next batch is larger than the limit.  A batch that is all there
+    // and still fails — a bad checksum, a codec the set does not hold
+    // — is refused, because that one is real.
+    while at < bytes.len(buf) and whole_batch_at(buf, at)
+        let r = decode_batch(buf, at, set)!
+        out = list.push(out, r.batch)
+        at = at + r.bytes
+    Ok(out)
 
 // The CRC-32C a batch's bytes should carry.
 //
 // Over everything after the checksum field, on the COMPRESSED record
 // bytes.  crc-nv's CRC-32C is what computes it — see the manifest.
 pub fn batch_crc(raw: Bytes) -> Result<Int, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkarecords.batch_crc")
+    // The declared length bounds the range, so a buffer holding a
+    // record set with more batches after this one still answers for
+    // this batch alone.
+    let span = batch_span(raw, 0)!
+    let covered = bytes.slice(raw, crc_start(), span)
+    Ok(crc32c_of(covered))
 
 // Whether an encoded batch's checksum matches its contents.
 //
@@ -536,7 +1052,13 @@ pub fn batch_crc(raw: Bytes) -> Result<Int, kafkaerror.KafkaFault>
 // `false`, because a report that says which two values differed is
 // what distinguishes a truncated read from a corrupt log.
 pub fn verify_crc(raw: Bytes) -> Result<Bool, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkarecords.verify_crc")
+    if bytes.len(raw) < crc_offset() + 4
+        return Err(kafkaerror.KafkaTruncated(bytes.len(raw), crc_offset() + 4 - bytes.len(raw), "a record batch's checksum"))
+    let stored = bytes.u32_be_at(raw, crc_offset()) ?? 0
+    let computed = batch_crc(raw)!
+    if computed == stored
+        return Ok(true)
+    Err(kafkaerror.KafkaBadCrc(computed, stored))
 
 // The absolute offset of a record in a batch.
 //
@@ -553,7 +1075,7 @@ pub fn verify_crc(raw: Bytes) -> Result<Bool, kafkaerror.KafkaFault>
 //     println("${kafkarecords.absolute_offset(b, r)}")   // 41000
 // ```
 pub fn absolute_offset(b: KafkaRecordBatch, r: KafkaRecord) -> Int
-    todo("kafka-codec-nv.kafkarecords.absolute_offset")
+    b.base_offset + r.offset_delta
 
 // The absolute timestamp of a record, in milliseconds since the Unix
 // epoch.
@@ -566,7 +1088,12 @@ pub fn absolute_offset(b: KafkaRecordBatch, r: KafkaRecord) -> Int
 // right answer by accident and the wrong one the day a topic's
 // `message.timestamp.type` is changed.
 pub fn absolute_timestamp(b: KafkaRecordBatch, r: KafkaRecord) -> Int
-    todo("kafka-codec-nv.kafkarecords.absolute_timestamp")
+    // Under log-append time the broker overwrote every producer
+    // timestamp with its own arrival time and the deltas are all zero,
+    // so the batch's `max_timestamp` is the one real answer.
+    if b.attributes.log_append_time
+        return b.max_timestamp
+    b.base_timestamp + r.timestamp_delta
 
 // The offset one past the batch's last record.
 //
@@ -575,7 +1102,9 @@ pub fn absolute_timestamp(b: KafkaRecordBatch, r: KafkaRecord) -> Int
 // not the last one read, and a consumer that commits the last one
 // reprocesses one record after every restart.
 pub fn next_offset(b: KafkaRecordBatch) -> Int
-    todo("kafka-codec-nv.kafkarecords.next_offset")
+    // The last offset is the base plus the last delta, and the offset
+    // a consumer asks for next is one past it.
+    b.base_offset + b.last_offset_delta + 1
 
 // Whether the batch is a transaction marker rather than data.
 //
@@ -590,7 +1119,7 @@ pub fn next_offset(b: KafkaRecordBatch) -> Int
 //     println("${kafkarecords.is_control_batch(kafkarecords.batch(0, 0))}")   // false
 // ```
 pub fn is_control_batch(b: KafkaRecordBatch) -> Bool
-    todo("kafka-codec-nv.kafkarecords.is_control_batch")
+    b.attributes.is_control
 
 // What a control batch says.
 //
@@ -599,14 +1128,34 @@ pub fn is_control_batch(b: KafkaRecordBatch) -> Bool
 // skip a marker written by a newer broker rather than stop the
 // partition on it.
 pub fn control_of(b: KafkaRecordBatch) -> Result<KafkaControlBatch, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkarecords.control_of")
+    if not is_control_batch(b)
+        return Err(kafkaerror.KafkaNotEncodable("control batch", "this batch carries application records, not a transaction marker"))
+    let first = list.first(b.records)
+    let Some(marker) = first else return Err(kafkaerror.KafkaRecordCountMismatch(1, 0))
+    // A marker's key is a version and the marker type; its value is a
+    // version and the writer's coordinator epoch.
+    let key = marker.key
+    if bytes.len(key) < 4
+        return Err(kafkaerror.KafkaTruncated(bytes.len(key), 4 - bytes.len(key), "a control record's key"))
+    let key_cur = kafkaprim.cursor(key, kafkaprim.KafkaClassic)
+    let key_ver = kafkaprim.read_int16(key_cur)!
+    let type_r = kafkaprim.read_int16(key_ver.cursor)!
+    let value = marker.value
+    if bytes.len(value) < 6
+        return Err(kafkaerror.KafkaTruncated(bytes.len(value), 6 - bytes.len(value), "a control record's value"))
+    let val_cur = kafkaprim.cursor(value, kafkaprim.KafkaClassic)
+    let val_ver = kafkaprim.read_int16(val_cur)!
+    let epoch_r = kafkaprim.read_int32(val_ver.cursor)!
+    Ok(KafkaControlBatch { control_type: control_type_of(type_r.value),
+                           coordinator_epoch: epoch_r.value })
 
 // The size in bytes one record occupies inside a batch.
 //
 // The varint length prefix included.  What `batch_size` sums, and what
 // a producer's batching policy measures a record against.
 pub fn record_size(b: KafkaRecordBatch, r: KafkaRecord) -> Int
-    todo("kafka-codec-nv.kafkarecords.record_size")
+    let body = record_body_size(r)
+    kafkaprim.varint_size(body) + body
 
 // A tagged-field-free encoding of one record, for a caller assembling
 // a batch itself.
@@ -617,4 +1166,14 @@ pub fn record_size(b: KafkaRecordBatch, r: KafkaRecord) -> Int
 // do that.
 pub fn encode_record(b: KafkaRecordBatch, r: KafkaRecord,
                      w: kafkaprim.KafkaWriter) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkarecords.encode_record")
+    let body = record_body_size(r)
+    var out = kafkaprim.write_varint(w, body)
+    out = kafkaprim.write_int8(out, r.attributes)
+    out = kafkaprim.write_varlong(out, r.timestamp_delta)
+    out = kafkaprim.write_varint(out, r.offset_delta)
+    out = write_record_field(out, r.key, r.key_is_null)
+    out = write_record_field(out, r.value, r.value_is_null)
+    out = kafkaprim.write_varint(out, list.len(r.headers))
+    for h in r.headers
+        out = write_record_header(out, h)
+    Ok(out)

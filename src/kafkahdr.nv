@@ -1,8 +1,6 @@
 // kafkahdr.nv — the four fields in front of every request and the one
 // in front of every response.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THE HEADER IS TINY AND ITS VERSION IS NOT ITS MESSAGE'S.  A request
 // header carries an API key, an API version, a correlation id and a
 // client id — and the header's own version is a different number from
@@ -103,7 +101,8 @@ pub struct KafkaResponseHeaderRead
 // ```
 pub fn request_header(k: kafkaapi.KafkaApiKey, version: Int, correlation_id: Int,
                       client_id: Str) -> KafkaRequestHeader
-    todo("kafka-codec-nv.kafkahdr.request_header")
+    KafkaRequestHeader { key: k, version: version, correlation_id: correlation_id,
+                         client_id: client_id, client_id_is_null: false, tagged: [] }
 
 // The same header with the client id sent as null rather than as
 // text.
@@ -112,7 +111,8 @@ pub fn request_header(k: kafkaapi.KafkaApiKey, version: Int, correlation_id: Int
 // the wire and mean different things to a broker — see the module
 // comment.
 pub fn with_null_client_id(h: KafkaRequestHeader) -> KafkaRequestHeader
-    todo("kafka-codec-nv.kafkahdr.with_null_client_id")
+    KafkaRequestHeader { key: h.key, version: h.version, correlation_id: h.correlation_id,
+                         client_id: h.client_id, client_id_is_null: true, tagged: h.tagged }
 
 // The same header carrying tagged fields.
 //
@@ -121,14 +121,18 @@ pub fn with_null_client_id(h: KafkaRequestHeader) -> KafkaRequestHeader
 // dropping them silently would lose whatever the caller meant to send.
 pub fn with_tagged(h: KafkaRequestHeader,
                    fields: [kafkaprim.KafkaTaggedField]) -> Result<KafkaRequestHeader, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkahdr.with_tagged")
+    if request_header_version(h) < 2
+        return Err(kafkaerror.KafkaNotEncodable("tagged fields", "a header v1 has nowhere to put them"))
+    Ok(KafkaRequestHeader { key: h.key, version: h.version, correlation_id: h.correlation_id,
+                            client_id: h.client_id, client_id_is_null: h.client_id_is_null,
+                            tagged: fields })
 
 // Which header version this request's header is written at.
 //
 // A thin reading of `kafkaapi.header_request_version`, here so a
 // caller holding a header does not have to take it apart to ask.
 pub fn request_header_version(h: KafkaRequestHeader) -> Int
-    todo("kafka-codec-nv.kafkahdr.request_header_version")
+    kafkaapi.header_request_version(h.key, h.version)
 
 // Write a request header into a writer.
 //
@@ -151,7 +155,18 @@ pub fn request_header_version(h: KafkaRequestHeader) -> Int
 // ```
 pub fn encode_request_header(w: kafkaprim.KafkaWriter,
                              h: KafkaRequestHeader) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkahdr.encode_request_header")
+    var out = kafkaprim.write_int16(w, kafkaapi.api_key_number(h.key))
+    out = kafkaprim.write_int16(out, h.version)
+    out = kafkaprim.write_int32(out, h.correlation_id)
+    if h.client_id_is_null
+        out = kafkaprim.write_null_str(out)
+    else
+        out = kafkaprim.write_str(out, h.client_id)!
+    // The writer's style is the message's, so this writes the header
+    // v2 section for a flexible message and nothing at all for a
+    // classic one — the header's own version is the same question.
+    out = kafkaprim.write_tagged_fields(out, h.tagged)
+    Ok(out)
 
 // Read a request header from a cursor.
 //
@@ -166,7 +181,30 @@ pub fn encode_request_header(w: kafkaprim.KafkaWriter,
 // version, and that is what makes it possible: this function reads
 // those two with a classic cursor, computes the style, and continues.
 pub fn decode_request_header(c: kafkaprim.KafkaCursor) -> Result<KafkaRequestHeaderRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkahdr.decode_request_header")
+    // The key and the version are fixed-width, so they read the same in
+    // either style; the style is then computed from them and the rest
+    // of the header is read at it.
+    let key_r = kafkaprim.read_int16(c)!
+    let after_key = key_r.cursor
+    let version_r = kafkaprim.read_int16(after_key)!
+    let after_version = version_r.cursor
+    let key = kafkaapi.api_key_of_number(key_r.value)!
+    // The style is computed here and the cursor rebuilt at it, rather
+    // than trusted from the caller: this function is the one that can
+    // know it, and it hands the body back on a cursor already at the
+    // right style.  The ceiling is carried across the rebuild.
+    let head = kafkaprim.with_max_bytes(
+        kafkaprim.cursor(c.buf, kafkaapi.wire_style(key, version_r.value)), c.max_bytes)
+    let body = kafkaprim.at(head, after_version.offset)
+    let corr_r = kafkaprim.read_int32(body)!
+    let client_r = kafkaprim.read_str(corr_r.cursor)!
+    let tags_r = kafkaprim.read_tagged_fields(client_r.cursor)!
+    let header = KafkaRequestHeader { key: key, version: version_r.value,
+                                      correlation_id: corr_r.value,
+                                      client_id: client_r.value,
+                                      client_id_is_null: client_r.is_null,
+                                      tagged: tags_r.fields }
+    Ok(KafkaRequestHeaderRead { header: header, cursor: tags_r.cursor })
 
 // Read a response header, given the key and version of the request it
 // answers.
@@ -190,7 +228,20 @@ pub fn decode_request_header(c: kafkaprim.KafkaCursor) -> Result<KafkaRequestHea
 // ```
 pub fn decode_response_header(c: kafkaprim.KafkaCursor, k: kafkaapi.KafkaApiKey,
                               version: Int) -> Result<KafkaResponseHeaderRead, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkahdr.decode_response_header")
+    let corr_r = kafkaprim.read_int32(c)!
+    let after_corr = corr_r.cursor
+    if kafkaapi.header_response_version(k, version) == 0
+        let header = KafkaResponseHeader { correlation_id: corr_r.value, tagged: [] }
+        return Ok(KafkaResponseHeaderRead { header: header, cursor: after_corr })
+    // Rebuilt flexible for the tagged section, so the `ApiVersions`
+    // exception is applied here rather than left to a caller's guess at
+    // the style: a v1 header is flexible by definition and a v0 one has
+    // no section at all.
+    let base = kafkaprim.with_max_bytes(
+        kafkaprim.cursor(c.buf, kafkaprim.KafkaFlexible), c.max_bytes)
+    let tags_r = kafkaprim.read_tagged_fields(kafkaprim.at(base, after_corr.offset))!
+    let header = KafkaResponseHeader { correlation_id: corr_r.value, tagged: tags_r.fields }
+    Ok(KafkaResponseHeaderRead { header: header, cursor: tags_r.cursor })
 
 // Write a response header.
 //
@@ -198,11 +249,14 @@ pub fn decode_response_header(c: kafkaprim.KafkaCursor, k: kafkaapi.KafkaApiKey,
 pub fn encode_response_header(w: kafkaprim.KafkaWriter, h: KafkaResponseHeader,
                               k: kafkaapi.KafkaApiKey,
                               version: Int) -> Result<kafkaprim.KafkaWriter, kafkaerror.KafkaFault>
-    todo("kafka-codec-nv.kafkahdr.encode_response_header")
+    let out = kafkaprim.write_int32(w, h.correlation_id)
+    if kafkaapi.header_response_version(k, version) == 0
+        return Ok(out)
+    Ok(kafkaprim.write_tagged_fields(out, h.tagged))
 
 // A response header carrying a correlation id and no tagged fields.
 pub fn response_header(correlation_id: Int) -> KafkaResponseHeader
-    todo("kafka-codec-nv.kafkahdr.response_header")
+    KafkaResponseHeader { correlation_id: correlation_id, tagged: [] }
 
 // Check that a response header answers the request that was sent.
 //
@@ -220,4 +274,6 @@ pub fn response_header(correlation_id: Int) -> KafkaResponseHeader
 //         None    => println("this answers request 7")
 // ```
 pub fn check_correlation(h: KafkaResponseHeader, expected: Int) -> ?kafkaerror.KafkaFault
-    todo("kafka-codec-nv.kafkahdr.check_correlation")
+    if h.correlation_id == expected
+        return None
+    Some(kafkaerror.KafkaCorrelationMismatch(h.correlation_id))
